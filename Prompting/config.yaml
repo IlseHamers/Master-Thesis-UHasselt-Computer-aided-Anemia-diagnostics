@@ -1,0 +1,174 @@
+# This file contains all configurable parameters for training and inference of QLORA.
+
+# Note: this was an existing file available from the MUMC+
+
+# =============================================================================
+# PATHS - File and directory locations
+# =============================================================================
+paths:
+  # Directory containing your training data
+  data_dir: /home/ilse-I-CDL/prompting/medgemma-gpu-finetune-anemia-template/data
+  # Name of the CSV file with training examples
+  # Must contain columns defined in LAB_FIELDS (see finetune.py) and output_column
+  csv_name: Gouden_standaard.xlsx
+
+  # Base directory for output files (trained adapters, inference results)
+  # Each training run creates a timestamped subdirectory here
+  # Example: /home/out/qlora-medgemma-20240115-143022/
+  out_base_dir: /media/ilse-I-CDL/data/users/Ilse - Uhasselt/output/qlora
+  input_dir: /media/ilse-I-CDL/data/users/Ilse - Uhasselt/input/10testcases
+  output_dir: /media/ilse-I-CDL/data/users/Ilse - Uhasselt/output/qlora_out
+  output_suffix: qlora_phi4_14b
+
+
+# =============================================================================
+# MODEL - Base model configuration
+# =============================================================================
+model:
+  base_model_id: microsoft/phi-4
+
+  # Trust code from the model repository
+  # Required for some models that include custom code
+  trust_remote_code: true
+
+  # How to distribute the model across GPUs
+  # "auto": Automatically split across available GPUs
+  # "cuda:0": Use only the first GPU
+  device_map: auto
+
+  # Load model with reduced CPU memory usage
+  # Recommended: true (prevents OOM during loading)
+  low_cpu_mem_usage: true
+
+
+# =============================================================================
+# QUANTIZATION - 4-bit quantization settings (QLoRA)
+# =============================================================================
+# Quantization reduces model memory by storing weights in lower precision.
+# 4-bit quantization reduces memory by ~8x compared to full precision.
+quantization:
+  # Enable 4-bit quantization
+  # Set to false if you have enough GPU memory for full precision
+  use_4bit: false
+  use_8bit: true
+
+  # Double quantization: also quantize the quantization constants
+  # Saves additional memory with minimal quality loss
+  bnb_4bit_use_double_quant: true
+
+  # Quantization type: "nf4" (NormalFloat4) is optimized for neural networks
+  # Alternative: "fp4" (standard 4-bit float)
+  bnb_4bit_quant_type: nf4
+
+
+# =============================================================================
+# LORA - Low-Rank Adaptation settings
+# =============================================================================
+# LoRA adds small trainable matrices to the model instead of training all weights.
+# This dramatically reduces memory and training time while maintaining quality.
+lora:
+  # Rank (r): Size of the low-rank matrices
+  # Higher = more capacity but more memory and compute
+  # Typical values: 8, 16, 32, 64
+  # Start with 16 for most tasks
+  r: 4
+
+  # Alpha: Scaling factor for LoRA weights
+  # Usually set equal to r, or 2x r
+  # Higher alpha = stronger LoRA influence
+  lora_alpha: 8
+
+  # Dropout: Regularization to prevent overfitting
+  # 0.0 = no dropout, 0.1 = 10% dropout
+  # Use higher values (0.1-0.2) for small datasets
+  lora_dropout: 0.1
+
+  # Bias: Whether to train bias terms
+  # "none": Don't train biases (recommended)
+  # "all": Train all biases
+  # "lora_only": Train only LoRA biases
+  bias: none
+
+  # Task type: What kind of task we're training for
+  # "CAUSAL_LM": Next-token prediction (text generation)
+  # "SEQ_CLS": Sequence classification
+  task_type: CAUSAL_LM
+
+  # Which layers to add LoRA adapters to
+  # "all-linear": Add to all linear layers (recommended for most cases)
+  # Or specify layers: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  target_modules: "all-linear"
+
+# -----------------------------------------------------------------------------
+# PROMPTING
+# -----------------------------------------------------------------------------
+prompting:
+  dataset_text_field: "text"             # internal field name — do not change
+  output_column: "Beschrijving"          # column containing expert conclusions
+  # note: the instruction/system prompt is defined as SYSTEM_PROMPT in finetune_anemia.py
+
+# =============================================================================
+# TRAINING - Hyperparameters for the training loop
+# =============================================================================
+training:
+  # Maximum sequence length (in tokens)
+  # Longer = can handle longer examples, but uses more memory
+  # MedGemma supports up to 8192 tokens
+  max_length: 1024
+
+  # Batch size per GPU
+  # Higher = faster training but more memory
+  # With 4-bit quantization on 24GB GPU, typically 1-4
+  batch_size: 1
+
+  # Gradient accumulation steps
+  # Simulates larger batch sizes without more memory
+  # Effective batch size = batch_size * grad_accum
+  # Example: batch_size=1, grad_accum=8 -> effective batch of 8
+  grad_accum: 4
+
+  # Number of training epochs
+  # One epoch = one pass through the entire dataset
+  # More epochs = more training, but risk of overfitting
+  # Start with 3, increase if model underfits
+  epochs: 2
+
+  # Learning rate
+  # How fast the model learns
+  # For LoRA fine-tuning, typical range: 1e-4 to 5e-4
+  # Too high = unstable training, too low = slow learning
+  learning_rate: 2.0e-4
+
+  # Random seed for reproducibility
+  # Set to any integer to get reproducible results
+  seed: 42
+
+  # Learning rate scheduler
+  # "cosine": Gradually decrease LR following a cosine curve
+  # "linear": Linearly decrease LR
+  # "constant": Keep LR constant
+  lr_scheduler_type: cosine
+
+  # Warmup ratio: Fraction of training for LR warmup
+  # During warmup, LR gradually increases from 0 to learning_rate
+  # Helps training stability at the start
+  warmup_ratio: 0.05
+
+  # How often to log training metrics (every N steps)
+  logging_steps: 5
+
+  # When to save checkpoints
+  # "epoch": Save after each epoch
+  # "steps": Save every N steps
+  # "no": Don't save intermediate checkpoints
+  save_strategy: epoch
+
+  # Optimizer
+  # "paged_adamw_8bit": Memory-efficient AdamW in 8-bit
+  # Recommended for QLoRA training
+  optim: paged_adamw_8bit
+
+  # Sequence packing: Combine multiple short examples into one sequence
+  # true = more efficient GPU utilization
+  # false = each example processed separately (simpler)
+  packing: false
