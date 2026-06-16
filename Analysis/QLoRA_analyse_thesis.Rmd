@@ -1,0 +1,356 @@
+---
+title: "QLoRA_analyse_thesis"
+author: "Ilse Hamers"
+date: "2026-06-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# readme
+This script analyses QLoRA rating CASTOR output.
+
+## Libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(irr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ordinal)
+library(stringr)
+library(purrr)
+library(readxl)
+```
+
+# Data
+```{r}
+data_dir <- Sys.getenv("ANEMIA_DATA_DIR", unset = "data")
+
+pad_workbook <- file.path(data_dir,"CASTOR\\CASTOR_export_compleet.xlsx")
+pad_mapping_pe <- file.path(data_dir,"CASTOR\\castor_survey_Prompt_Engineering_Beoordeling_mapping.csv")
+pad_mapping_qlora <- file.path(data_dir,"CASTOR\\castor_survey_QLoRA_castor_mapping.csv")
+```
+
+## Zero-shot baseline from Prompt Engineering
+```{r}
+df_pe_wide <- read_excel(pad_workbook, sheet = "Prompt_Engineering_Beoordeling")
+
+df_pe_wide <- df_pe_wide %>%
+  mutate(beoordelaar = case_when(
+    `Castor Participant ID` == 110006 ~ "B2",
+    `Castor Participant ID` == 110007 ~ "B1",
+    `Castor Participant ID` == 110008 ~ "B3"
+  )) %>%
+  select(-`Castor Participant ID`)
+
+df_map_pe <- read.csv(pad_mapping_pe)
+
+df_map_pe <- df_map_pe %>%
+  mutate(
+    UniekLabnummer = str_extract(bestandsnaam, "^\\d+"),
+    methode = str_extract(bestandsnaam, "(zero|one|three)shot"),
+    model = str_extract(bestandsnaam, "(medgemma4b|medgemma27b|phi4)")
+  ) %>%
+  select(-bestandsnaam)
+
+score_cols_pe <- names(df_pe_wide)[str_detect(names(df_pe_wide), "^prompt_engineering")]
+
+df_pe_lang <- df_pe_wide %>%
+  select(beoordelaar, all_of(score_cols_pe)) %>%
+  pivot_longer(
+    cols      = all_of(score_cols_pe),
+    names_to  = "variabele",
+    values_to = "score"
+  ) %>%
+  mutate(
+    casus_nr = str_extract(variabele, "casus\\d+"),
+    factor   = str_extract(variabele, "[^_]+$")
+  ) %>%
+  select(beoordelaar, casus_nr, factor, score) %>%
+  left_join(df_map_pe, by = "casus_nr") %>%
+  filter(methode == "zeroshot") %>%   # alleen zero-shot als baseline
+  mutate(methode = "Zero-shot")
+```
+
+## QLoRA data
+```{r}
+df_qlora_wide <- read_excel(pad_workbook, sheet = "QLoRA_castor")
+
+df_qlora_wide <- df_qlora_wide %>%
+  mutate(beoordelaar = case_when(
+    `Castor Participant ID` == 110006 ~ "B2",
+    `Castor Participant ID` == 110007 ~ "B1",
+    `Castor Participant ID` == 110008 ~ "B3"
+  )) %>%
+  select(-`Castor Participant ID`)
+
+df_map_qlora <- read.csv(pad_mapping_qlora)
+
+df_map_qlora <- df_map_qlora %>%
+  mutate(
+    UniekLabnummer = str_extract(bestandsnaam, "^\\d+"),
+    methode = if_else(str_detect(bestandsnaam, "_hist"), "hist", "goud"),
+    model = str_extract(bestandsnaam, "(medgemma_4b|medgemma_27b|phi4)")
+  ) %>%
+  select(-bestandsnaam)
+
+score_cols_qlora <- names(df_qlora_wide)[str_detect(names(df_qlora_wide), "^qlora_castor")]
+
+df_qlora_lang <- df_qlora_wide %>%
+  select(beoordelaar, all_of(score_cols_qlora)) %>%
+  pivot_longer(
+    cols      = all_of(score_cols_qlora),
+    names_to  = "variabele",
+    values_to = "score"
+  ) %>%
+  mutate(
+    casus_nr = str_extract(variabele, "casus\\d+"),
+    factor   = str_extract(variabele, "[^_]+$")
+  ) %>%
+  select(beoordelaar, casus_nr, factor, score) %>%
+  left_join(df_map_qlora, by = "casus_nr")
+```
+
+## merge and neater labels
+```{r}
+df_lang <- bind_rows(df_pe_lang, df_qlora_lang) %>%
+  mutate(
+    model = case_when(
+      model %in% c("medgemma4b", "medgemma_4b") ~ "MedGemma 4B",
+      model %in% c("medgemma27b", "medgemma_27b") ~ "MedGemma 27B",
+      model == "phi4" ~ "Phi-4 14B"
+    ),
+    methode = case_when(
+      methode == "Zero-shot" ~ "Zero-shot",
+      methode == "hist" ~ "QLoRA (historic)",
+      methode == "goud" ~ "QLoRA (gold standard)"
+    ),
+    factor = case_when(
+      factor == "correctheid" ~ "Clinical correctness",
+      factor == "nuance" ~ "Nuance",
+      factor == "databasering" ~ "Hallucination",
+      factor == "format" ~ "Format",
+      factor == "taalgebruik" ~ "Language"
+    )
+  )
+
+factor_volgorde  <- c("Clinical correctness", "Nuance", "Hallucination", "Format", "Language")
+methode_volgorde <- c("Zero-shot", "QLoRA (historic)", "QLoRA (gold standard)")
+
+df_lang <- df_lang %>%
+  mutate(
+    factor  = factor(factor, levels = factor_volgorde),
+    model   = factor(model, levels = c("MedGemma 4B", "MedGemma 27B", "Phi-4 14B")),
+    methode = factor(methode, levels = methode_volgorde)
+  )
+
+cat("\nVerdeling model × methode:\n")
+print(table(df_lang$model, df_lang$methode))
+
+df_lang <- df_lang %>%
+  mutate(score = as.integer(score))
+```
+
+## ICC
+```{r}
+icc_per_factor <- map_dfr(factoren, function(f) {
+
+  mat_f <- df_lang %>%
+    filter(factor == f) %>%
+    mutate(item_id = paste(UniekLabnummer, model, methode, sep = "_")) %>%
+    select(beoordelaar, item_id, score) %>%
+    pivot_wider(names_from = beoordelaar, values_from = score) %>%
+    select(B1, B2, B3)
+
+  res_single <- icc(mat_f, model = "twoway", type = "agreement", unit = "single")
+  res_avg    <- icc(mat_f, model = "twoway", type = "agreement", unit = "average")
+
+  tibble(
+    factor = f,
+    ICC_single = round(res_single$value, 3),
+    ICC_avg = round(res_avg$value, 3),
+    lower_single = round(res_single$lbound, 3),
+    upper_single = round(res_single$ubound, 3),
+    lower_avg = round(res_avg$lbound, 3),
+    upper_avg = round(res_avg$ubound, 3)
+  )
+})
+
+print(icc_per_factor)
+```
+
+
+# Boxplots per factor: not used in thesis!
+```{r}
+model_kleuren <- c(
+  "MedGemma 4B" = "#e08282",
+  "MedGemma 27B" = "#bc4242",
+  "Phi-4 14B" = "#2c3e50"
+)
+
+for (f in factoren) {
+  df_sub <- df_lang %>% filter(factor == f)
+
+  p <- ggplot(df_sub, aes(x = methode, y = score, fill = model)) +
+    geom_boxplot(alpha = 0.9, outlier.size = 1.5, position = position_dodge(0.8)) +
+    stat_summary(
+      aes(group = model),
+      fun = mean, geom = "point", shape = 23, size = 2,
+      fill = "white", position = position_dodge(0.8)
+    ) +
+    labs(
+      title = paste("Scores per methode en model voor:", f),
+      x = "Methode", y = "Score", fill = "LLM Model"
+    ) +
+    scale_fill_manual(values = model_kleuren) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 15, hjust = 1)
+    ) +
+    scale_y_continuous(breaks = 1:5)
+
+  print(p)
+}
+```
+
+# boxplot cumulative
+```{r}
+df_totaal <- df_lang %>%
+  group_by(beoordelaar, casus_nr, model, methode) %>%
+  summarise(totaalscore = sum(score, na.rm = TRUE), .groups = "drop")
+
+p_totaal <- ggplot(df_totaal, aes(x = methode, y = totaalscore, fill = model)) +
+  geom_boxplot(aes(alpha = methode), outlier.size = 1.5, position = position_dodge(0.8)) +
+  
+  geom_vline(xintercept = 1.5, linetype = "dashed", color = 'gray') +
+  
+  stat_summary(
+    aes(group = model),
+    fun = mean, geom = "point", shape = 23, size = 2,
+    fill = "white", position = position_dodge(0.8)
+  ) +
+  labs(
+    title = "Total cumulative score — (Q)LoRA vs. Zero-shot baseline",
+    x = "Method", y = "Total Score", fill = "Model"
+  ) +
+  scale_fill_manual(values = model_kleuren) +
+  
+  scale_alpha_manual(values = c("Zero-shot" = 0.5, "QLoRA (historic)" = 0.9, "QLoRA (gold standard)" = 0.9), guide = "none") + 
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  ) +
+  scale_y_continuous(breaks = seq(0, max(df_totaal$totaalscore, na.rm = TRUE), by = 2))
+
+print(p_totaal)
+```
+
+```{r}
+df_totaal_icc <- df_totaal %>%
+  left_join(unique(select(df_lang, casus_nr, UniekLabnummer, model, methode)), 
+            by = c("casus_nr", "model", "methode")) %>%
+  mutate(item_id = paste(UniekLabnummer, model, methode, sep = "_")) %>%
+  select(beoordelaar, item_id, totaalscore) %>%
+  pivot_wider(names_from = beoordelaar, values_from = totaalscore) %>%
+  select(B1, B2, B3)
+
+icc(df_totaal_icc, model = "twoway", type = "agreement", unit = "single")
+icc(df_totaal_icc, model = "twoway", type = "agreement", unit = "average")
+```
+
+# Statistics
+
+## CLMM per factor
+```{r}
+clmm_resultaten <- list()
+
+for (f in factoren) {
+  df_sub <- df_lang %>%
+    filter(factor == f) %>%
+    mutate(score = factor(score, ordered = TRUE))
+
+  cat("\n", strrep("=", 60), "\n")
+  cat("Factor:", f, "\n")
+  cat(strrep("=", 60), "\n")
+
+  model <- clmm(
+    score ~ model + methode + (1 | UniekLabnummer) + (1 | beoordelaar),
+    data = df_sub,
+    link = "logit"
+  )
+
+  clmm_resultaten[[f]] <- model
+  print(summary(model))
+}
+```
+
+## LMM cumulative
+```{r}
+df_totaal_lmm <- df_lang %>%
+  group_by(beoordelaar, casus_nr, UniekLabnummer, model, methode) %>%
+  summarise(totaalscore = sum(score, na.rm = TRUE), .groups = "drop")
+
+model_totaal_lmm <- lmer(
+  totaalscore ~ model + methode + (1 | UniekLabnummer) + (1 | beoordelaar),
+  data = df_totaal_lmm
+)
+
+summary(model_totaal_lmm)
+
+par(mfrow = c(1, 2))
+plot(fitted(model_totaal_lmm), resid(model_totaal_lmm),
+     xlab = "Fitted", ylab = "Residuals", main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+qqnorm(resid(model_totaal_lmm), main = "Q-Q plot residuals")
+qqline(resid(model_totaal_lmm), col = "red")
+par(mfrow = c(1, 1))
+```
+
+## Post-hoc (EMMeans) per factor
+```{r}
+posthoc_resultaten <- list()
+
+for (f in factoren) {
+  cat("\n", strrep("=", 60), "\n")
+  cat("Post-hoc:", f, "\n")
+  cat(strrep("=", 60), "\n")
+
+  model_f <- clmm_resultaten[[f]]
+
+  emm_model <- emmeans(model_f, ~ model, mode = "latent")
+  cat("\n-- Model --\n")
+  print(pairs(emm_model, adjust = "bonferroni"))
+
+  emm_methode <- emmeans(model_f, ~ methode, mode = "latent")
+  cat("\n-- Methode --\n")
+  print(pairs(emm_methode, adjust = "bonferroni"))
+
+  posthoc_resultaten[[f]] <- list(model = emm_model, methode = emm_methode)
+}
+```
+
+## Post-hoc totaalscore
+```{r}
+em_model <- emmeans(model_totaal_lmm, pairwise ~ model, adjust = "bonferroni")
+print(em_model$emmeans)
+print(em_model$contrasts)
+
+em_methode <- emmeans(model_totaal_lmm, pairwise ~ methode, adjust = "bonferroni")
+print(em_methode$emmeans)
+print(em_methode$contrasts)
+```
+
