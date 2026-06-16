@@ -1,0 +1,333 @@
+---
+title: "vergelijking_alle_methoden_thesis"
+author: "Ilse Hamers"
+date: "2026-06-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# readme
+This script is the analysis of all methods and models done after the 3 intermediate analyses
+
+## Libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readxl)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(knitr)
+```
+
+# Data
+```{r}
+data_dir <- Sys.getenv("ANEMIA_DATA_DIR", unset = "data")
+
+pad_workbook <- file.path(data_dir,"CASTOR\\CASTOR_export_compleet.xlsx")
+pad_mapping_pe <- file.path(data_dir,"CASTOR\\castor_survey_Prompt_Engineering_Beoordeling_mapping.csv")
+pad_mapping_rag <- file.path(data_dir,"CASTOR\\castor_survey_RAG_Beoordeling_mapping.csv")
+pad_mapping_qlora <- file.path(data_dir,"CASTOR\\castor_survey_QLoRA_castor_mapping.csv")
+```
+
+## wide to long function
+```{r}
+wide_naar_lang <- function(df_wide, prefix_kolommen, mapping_df) {
+  score_cols <- names(df_wide)[str_detect(names(df_wide), paste0("^", prefix_kolommen))]
+
+  df_wide %>%
+    pivot_longer(
+      cols = all_of(score_cols),
+      names_to = "variabele",
+      values_to = "score"
+    ) %>%
+    mutate(
+      casus_nr = str_extract(variabele, "casus\\d+"),
+      factor = str_extract(variabele, "[^_]+$")
+    ) %>%
+    select(beoordelaar, casus_nr, factor, score) %>%
+    left_join(mapping_df, by = "casus_nr") %>%
+    mutate(score = as.integer(score))
+}
+
+beoordelaar_hernoemen <- function(df) {
+  df %>%
+    mutate(beoordelaar = case_when(
+      `Castor Participant ID` == 110006 ~ "B2",
+      `Castor Participant ID` == 110007 ~ "B1",
+      `Castor Participant ID` == 110008 ~ "B3"
+    )) %>%
+    select(-`Castor Participant ID`)
+}
+```
+
+## Prompt Engineering
+```{r}
+df_pe_wide <- read_excel(pad_workbook, sheet = "Prompt_Engineering_Beoordeling") %>%
+  beoordelaar_hernoemen()
+
+df_map_pe <- read.csv(pad_mapping_pe) %>%
+  mutate(
+    UniekLabnummer = str_extract(bestandsnaam, "^\\d+"),
+    methode = str_extract(bestandsnaam, "(zero|one|three)shot"),
+    model = str_extract(bestandsnaam, "(medgemma4b|medgemma27b|phi4)")
+  ) %>%
+  select(-bestandsnaam)
+
+df_pe_lang <- wide_naar_lang(df_pe_wide, "prompt_engineering", df_map_pe) %>%
+  mutate(
+    stage = "Prompt Engineering",
+    methode = case_when(
+      methode == "zeroshot" ~ "Zero-shot",
+      methode == "oneshot" ~ "One-shot",
+      methode == "threeshot" ~ "Three-shot"
+    )
+  )
+```
+
+## RAG
+```{r}
+df_rag_wide <- read_excel(pad_workbook, sheet = "RAG_Beoordeling") %>%
+  beoordelaar_hernoemen()
+
+df_map_rag <- read.csv(pad_mapping_rag) %>%
+  mutate(
+    UniekLabnummer = str_extract(bestandsnaam, "^\\d+"),
+    methode = case_when(
+      str_detect(bestandsnaam, "_hist") ~ "hist",
+      str_detect(bestandsnaam, "_goud") ~ "goud"
+    ),
+    model = str_extract(bestandsnaam, "(medgemma4b|medgemma27b|phi4)")
+  ) %>%
+  select(-bestandsnaam)
+
+df_rag_lang <- wide_naar_lang(df_rag_wide, "rag_beoordeling", df_map_rag) %>%
+  mutate(
+    stage = "RAG",
+    methode = case_when(
+      methode == "hist" ~ "RAG (historic)",
+      methode == "goud" ~ "RAG (gold standard)"
+    )
+  )
+```
+
+## QLoRA
+```{r}
+df_qlora_wide <- read_excel(pad_workbook, sheet = "QLoRA_castor") %>%
+  beoordelaar_hernoemen()
+
+df_map_qlora <- read.csv(pad_mapping_qlora) %>%
+  mutate(
+    UniekLabnummer = str_extract(bestandsnaam, "^\\d+"),
+    methode = if_else(str_detect(bestandsnaam, "_hist"), "hist", "goud"),
+    model = str_extract(bestandsnaam, "(medgemma_4b|medgemma_27b|phi4)")
+  ) %>%
+  select(-bestandsnaam)
+
+df_qlora_lang <- wide_naar_lang(df_qlora_wide, "qlora_castor", df_map_qlora) %>%
+  mutate(
+    stage   = "QLoRA",
+    methode = case_when(
+      methode == "hist" ~ "QLoRA (historic)",
+      methode == "goud" ~ "QLoRA (gold standard)"
+    )
+  )
+```
+
+## merge into one dataset
+```{r}
+df_alle <- bind_rows(df_pe_lang, df_rag_lang, df_qlora_lang) %>%
+  mutate(
+    model = case_when(
+      model %in% c("medgemma4b", "medgemma_4b") ~ "MedGemma 4B",
+      model %in% c("medgemma27b", "medgemma_27b") ~ "MedGemma 27B",
+      model == "phi4" ~ "Phi-4 14B"
+    ),
+    factor = case_when(
+      factor == "correctheid" ~ "Clinical correctness",
+      factor == "nuance" ~ "Nuance",
+      factor == "databasering" ~ "Hallucination",
+      factor == "format" ~ "Format",
+      factor == "taalgebruik" ~ "Language"
+    ),
+    # ordered
+    methode = factor(methode, levels = c(
+      "Zero-shot", "One-shot", "Three-shot",
+      "RAG (historic)", "RAG (gold standard)",
+      "QLoRA (historic)", "QLoRA (gold standard)"
+    )),
+    stage = factor(stage, levels = c("Prompt Engineering", "RAG", "QLoRA")),
+    model = factor(model, levels = c("MedGemma 4B", "MedGemma 27B", "Phi-4 14B"))
+  )
+
+df_totaal <- df_alle %>%
+  group_by(beoordelaar, casus_nr, UniekLabnummer, model, methode, stage) %>%
+  summarise(totaalscore = sum(score, na.rm = TRUE), .groups = "drop")
+```
+
+# Descriptives
+```{r}
+df_desc <- df_totaal %>%
+  group_by(model, stage, methode) %>%
+  summarise(
+    N = n(),
+    Mean = round(mean(totaalscore), 2),
+    SD = round(sd(totaalscore), 2),
+    Median = round(median(totaalscore), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(model, stage, methode)
+
+kable(df_desc,
+      caption = "Gemiddelde totaalscore (± SD) per model, stage en methode",
+      col.names = c("Model", "Stage", "Method", "N", "Mean", "SD", "Median"))
+```
+
+# Visualisations
+
+## boxplot per model with all methods --> not used in thesis
+
+```{r fig.width=10, fig.height=5}
+model_kleuren <- c(
+  "Prompt Engineering" = "#e08282",
+  "RAG" = "#bc4242",
+  "QLoRA" = "#2c3e50"
+)
+
+for (m in levels(df_totaal$model)) {
+
+  df_sub <- df_totaal %>% filter(model == m)
+
+  p <- ggplot(df_sub, aes(x = methode, y = totaalscore, fill = stage)) +
+    geom_boxplot(alpha = 0.85, outlier.size = 1.5,
+                 position = position_dodge2(preserve = "single")) +
+    stat_summary(
+      aes(group = stage),
+      fun = mean, geom = "point", shape = 23, size = 2.5,
+      fill = "white", position = position_dodge2(width = 0.75, preserve = "single")
+    ) +
+    scale_fill_manual(values = model_kleuren) +
+    labs(
+      title = paste("Totaalscore per methode —", m),
+      x = "Methode",
+      y = "Totaalscore (max = 25)",
+      fill = "Stage"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 30, hjust = 1)
+    ) +
+    scale_y_continuous(breaks = seq(0, 25, by = 2)) +
+    geom_vline(xintercept = c(3.5, 5.5), linetype = "dashed",
+               colour = "grey60", linewidth = 0.4)
+
+  print(p)
+}
+```
+
+## average cumulative score per model × methode
+```{r fig.width=10, fig.height=5}
+df_means <- df_totaal %>%
+  group_by(model, methode, stage) %>%
+  summarise(
+    mean_score = mean(totaalscore),
+    se_score = sd(totaalscore) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(df_means, aes(x = methode, y = mean_score,
+                     colour = model, group = model)) +
+  geom_line(linewidth = 0.8, alpha = 0.7) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_score - se_score,
+                    ymax = mean_score + se_score),
+                width = 0.2, alpha = 0.7) +
+  scale_colour_manual(values = c(
+    "MedGemma 4B" = "#e08282",
+    "MedGemma 27B" = "#bc4242",
+    "Phi-4 14B" = "#2c3e50"
+  )) +
+  labs(
+    title = "Average cumulative score (± SE) per model and method",
+    x = "Method",
+    y = "Average cumulative score",
+    colour = "Model"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  ) +
+  scale_y_continuous(breaks = seq(10, 25, by = 1)) +
+  geom_vline(xintercept = c(3.5, 5.5), linetype = "dashed",
+             colour = "grey60", linewidth = 0.4) +
+  annotate("text", x = 2,   y = 10.5, label = "Prompt Eng.",
+           size = 3, colour = "grey50") +
+  annotate("text", x = 4.5, y = 10.5, label = "RAG",
+           size = 3, colour = "grey50") +
+  annotate("text", x = 6.5, y = 10.5, label = "QLoRA",
+           size = 3, colour = "grey50")
+```
+
+# LLm assumptions
+```{r}
+df_lmm_alle <- df_totaal %>%
+  mutate(
+    model = relevel(model, ref = "MedGemma 4B"),
+    stage = relevel(stage, ref = "Prompt Engineering")
+  )
+
+model_alle_lmm <- lmer(
+  totaalscore ~ model + stage + (1 | UniekLabnummer) + (1 | beoordelaar),
+  data = df_lmm_alle
+)
+
+summary(model_alle_lmm)
+
+par(mfrow = c(1, 2))
+plot(fitted(model_alle_lmm), resid(model_alle_lmm),
+     xlab = "Fitted", ylab = "Residuals", main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+qqnorm(resid(model_alle_lmm), main = "Q-Q plot residuals")
+qqline(resid(model_alle_lmm), col = "red")
+par(mfrow = c(1, 1))
+```
+
+# emmeans
+```{r}
+em_stage <- emmeans(model_alle_lmm, pairwise ~ stage, adjust = "bonferroni")
+cat("\n-- Stage emmeans --\n")
+print(em_stage$emmeans)
+cat("\n-- Stage contrastes --\n")
+print(em_stage$contrasts)
+
+em_model_int <- emmeans(model_alle_lmm, pairwise ~ model, adjust = "bonferroni")
+cat("\n-- Model emmeans --\n")
+print(em_model_int$emmeans)
+cat("\n-- Model contrastes --\n")
+print(em_model_int$contrasts)
+```
+```{r}
+model_interactie <- lmer(
+  totaalscore ~ model * stage + (1 | UniekLabnummer) + (1 | beoordelaar),
+  data = df_lmm_alle
+)
+
+summary(model_interactie)
+```
+
+
+
