@@ -1,0 +1,281 @@
+---
+title: "data_exploration_thesis"
+author: "Ilse Hamers"
+date: "2026-04-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#readme
+Data exploration of historic dataset
+
+## Libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(scales)
+library(purrr)
+```
+
+## Data
+```{r}
+data_dir <- Sys.getenv("ANEMIA_DATA_DIR", unset = "data")
+
+path <- file.path(data_dir,"data_clean_wide.csv")
+data <- read.csv(path, check.names = FALSE)
+
+data <- data %>%
+  mutate(Leeftijd = as.numeric(str_remove(Leeftijd, "j")))
+```
+
+---
+
+# aantal consults
+```{r, fig.width= 10, fig.height=4}
+aanvragen <- read_excel(path = "C:\\Users\\ilseh\\Desktop\\Master thesis UHasselt\\Data\\aantallen.xlsx", col_names = T)
+
+ggplot(aanvragen, aes(x = Startdatum, y = Aantal)) +
+  geom_line(aes(colour = "#bc4242"), size = 1.5) +
+  labs(title = "Number of anemia conclusions written at MUMC+ over time", x = "Date", y = "Amount") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Sex distribution
+```{r}
+data %>%
+  count(Geslacht) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+ggplot(data, aes(x = Geslacht)) +
+  geom_bar(fill = "#bc4242") +
+  labs(title = "Distribution of Sex (full dataset)", x = "Sex", y = "Count") +
+  theme_minimal()
+```
+
+# Age distribution
+```{r}
+summary(data$Leeftijd)
+
+ggplot(data, aes(x = Leeftijd)) +
+  geom_histogram(binwidth = 5, fill = "#bc4242", color = "white") +
+  labs(title = "Age Distribution (full dataset)", x = "Age", y = "Count") +
+  theme_minimal()
+
+ggplot(data, aes(x = Geslacht, y = Leeftijd, fill = Geslacht)) +
+  geom_boxplot(alpha = 1) +
+  scale_fill_manual(values = c("M" = "#bc4242", "V" = "#e8a0a0")) +
+  labs(title = "Age by Sex (full dataset)", x = "Sex", y = "Age") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Anemia percentage
+```{r}
+data <- data %>%
+  mutate(anemie = !is.na(`Anemie protocol`) & `Anemie protocol` != "Geen anemie.")
+
+data %>%
+  count(anemie) %>%
+  mutate(
+    label = ifelse(anemie, "Anemia", "No anemia"),
+    pct   = round(n / sum(n) * 100, 1)
+  )
+```
+
+# same plots but for anemia subset
+```{r}
+data_anemie <- data %>%
+  filter(`Anemie protocol` != "Geen anemie.")
+
+# Sex
+data_anemie %>%
+  count(Geslacht) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+ggplot(data_anemie, aes(x = Geslacht)) +
+  geom_bar(fill = "#bc4242") +
+  theme_minimal() +
+  labs(title = "Distribution of Sex (anemia cases only)", x = "Sex", y = "Count")
+
+# Age
+summary(data_anemie$Leeftijd)
+
+ggplot(data_anemie, aes(x = Leeftijd)) +
+  geom_histogram(binwidth = 5, fill = "#bc4242", color = "white") +
+  theme_minimal() +
+  labs(title = "Age Distribution (anemia cases only)", x = "Age", y = "Count")
+
+ggplot(data_anemie, aes(x = Geslacht, y = Leeftijd, fill = Geslacht)) +
+  geom_boxplot(alpha = 1) +
+  scale_fill_manual(values = c("M" = "#bc4242", "V" = "#e8a0a0")) +
+  labs(title = "Age by Sex (anemia cases only)", x = "Sex", y = "Age") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Conclusion (Beschrijving) word count
+```{r}
+data_anemie <- data_anemie %>%
+  mutate(beschrijving_words = str_count(Beschrijving, "\\S+"))
+
+summary(data_anemie$beschrijving_words)
+
+ggplot(data_anemie, aes(x = beschrijving_words)) +
+  geom_histogram(binwidth = 5, fill = "#bc4242", color = "white") +
+  theme_minimal() +
+  labs(
+    title = "Word Count of Expert Conclusions (Beschrijving)",
+    x = "Number of Words",
+    y = "Count"
+  )
+```
+
+# Missingness per lab variable
+```{r}
+meta_cols <- c("UniekLabnummer", "Geslacht", "Leeftijd",
+               "Anemie protocol", "Beschrijving", "anemie", "Patientnummer")
+lab_cols  <- setdiff(names(data), meta_cols)
+
+missingness <- data %>%
+  select(all_of(lab_cols)) %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing))
+
+print(missingness, n = Inf)
+
+ggplot(missingness, aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "#bc4242") +
+  coord_flip() +
+  labs(
+    title = "Missingness per Lab Variable (full dataset)",
+    x = "Variable",
+    y = "% Missing"
+  ) +
+  theme_minimal()
+```
+
+```{r fig.height=7}
+missingness_split <- data %>%
+  select(anemie, all_of(lab_cols)) %>%
+  group_by(anemie) %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100), .groups = "drop") %>%
+  pivot_longer(-anemie, names_to = "variable", values_to = "pct_missing") %>%
+  mutate(anemie = ifelse(anemie, "Anemia", "No anemia"))
+
+ggplot(missingness_split,
+       aes(x = reorder(variable, pct_missing), y = pct_missing, fill = anemie)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Anemia" = "#bc4242", "No anemia" = "#e8a0a0")) +
+  labs(
+    title = "Missingness per Lab Variable by Anemia Status",
+    x = "Variable",
+    y = "% Missing",
+    fill  = NULL
+  ) +
+  theme_minimal()
+
+missingness_split %>%
+  pivot_wider(names_from = anemie, values_from = pct_missing) %>%
+  arrange(desc(Anemia)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+```
+
+# Lab value distributions (numeric variables) --> not used in thesis
+
+## by sex
+```{r fig.height=4, fig.width=6, results='asis'}
+walk(unique(data_long$variable), function(v) {
+  p <- data_long %>%
+    filter(variable == v) %>%
+    ggplot(aes(x = value, fill = Geslacht)) +
+    geom_density(alpha = 0.7) +
+    scale_fill_manual(values = c("M" = "#bc4242", "V" = "#e8a0a0")) +
+    labs(title = v, x = "Value", y = "Density", fill = "Sex") +
+    theme_minimal()
+  print(p)
+})
+```
+
+## by anemia status
+```{r fig.height=4, fig.width=5, results='asis'}
+walk(unique(data_long$variable), function(v) {
+  p <- data_long %>%
+    filter(variable == v) %>%
+    ggplot(aes(x = anemie, y = value, fill = anemie)) +
+    geom_boxplot(outlier.size = 0.5, alpha = 0.8) +
+    scale_x_discrete(labels = c("FALSE" = "No anemia", "TRUE" = "Anemia")) +
+    scale_fill_manual(values = c("FALSE" = "#e8a0a0", "TRUE" = "#bc4242")) +
+    labs(title = v, x = NULL, y = "Value") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  print(p)
+})
+```
+
+## Direction-class distribution (from RAG prep output)
+```{r fig.height=7, fig.width=9}
+path_klassen <- "C:\\Users\\ilseh\\Desktop\\Master thesis UHasselt\\Scripts\\referentie_database_klassen_RAG.csv"
+ref_klassen  <- read.csv(path_klassen, check.names = FALSE)
+
+klasse_cols <- names(ref_klassen)[grepl("_klasse$", names(ref_klassen))]
+
+klasse_long <- ref_klassen %>%
+  select(all_of(klasse_cols)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "klasse") %>%
+  mutate(
+    variable = str_remove(variable, "_klasse$"),
+    klasse   = factor(klasse, levels = c(2, 1, 0, -1, -2))
+  ) %>%
+  filter(!is.na(klasse))
+
+klasse_pct <- klasse_long %>%
+  count(variable, klasse) %>%
+  group_by(variable) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+var_order <- klasse_pct %>%
+  filter(klasse == 0) %>%
+  select(variable, pct_normal = pct)
+
+var_order_full <- klasse_pct %>%
+  distinct(variable) %>%
+  left_join(var_order, by = "variable") %>%
+  mutate(pct_normal = replace_na(pct_normal, 0))
+
+klasse_pct <- klasse_pct %>%
+  left_join(var_order_full, by = "variable")
+
+ggplot(klasse_pct,
+       aes(x = reorder(variable, pct_normal), y = pct, fill = klasse)) +
+  geom_col(position = "stack") +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "2" = "#7b0000",
+      "1" = "#e06060",
+      "0" = "#d0d0d0",
+      "-1" = "#6080c0",
+      "-2" = "#1a3a7a"
+    ),
+    labels = c("+2 Very high", "+1 High", "0 Normal", "-1 Low", "-2 Very low")
+  ) +
+  labs(
+    title = "Direction-Class Distribution per Lab Variable",
+    x = "Variable",
+    y = "% of non-missing values",
+    fill  = "Direction class"
+  ) +
+  theme_minimal()
+```
+
+
