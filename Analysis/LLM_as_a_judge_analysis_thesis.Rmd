@@ -1,0 +1,370 @@
+---
+title: "LLM_as_a_judge_analysis_thesis"
+author: "Ilse Hamers"
+date: "2026-05-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# readme
+This script is the analysis of the LLM-as-a-judge survey of experts and LLMs
+
+## Libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(irr)
+library(psych)
+library(ggplot2)
+library(forcats)
+library(tibble)
+```
+
+
+## Expert data
+```{r}
+data_dir <- Sys.getenv("ANEMIA_DATA_DIR", unset = "data")
+
+pad_expert <- file.path(data_dir,"LLM-as-a-judge_qualtrics.xlsx")
+data_expert <- read_excel(pad_expert)
+
+data_expert <- data_expert %>%
+  select(-'Duration (in seconds)', -'Q154', -'SC0') %>%
+  dplyr::slice(-1)
+
+data_expert_format <- data_expert %>%
+  mutate(Beoordelaar = as.character(row_number())) %>%
+  pivot_longer(
+    cols      = -Beoordelaar,
+    names_to  = c("Case", ".value"),
+    names_pattern = "(\\d+)([a-e])"
+  ) %>%
+  rename(
+    'Clinical correctness' = a,
+    Nuance = b,
+    Hallucination = c,
+    Format = d,
+    Language = e
+  ) %>%
+  mutate(across(c('Clinical correctness', Nuance, Hallucination, Format, Language),
+                as.numeric))
+```
+
+## LLM data
+```{r}
+pad_llm <- file.path(data_dir,"LLM-as-a-judge_LLMs.xlsx")
+data_llm <- read_excel(pad_llm) %>%
+  mutate(Case = as.character(Case))
+```
+
+## function: ICC per dimension
+```{r}
+dimensies <- c('Clinical correctness', 'Nuance', 'Hallucination', 'Format', 'Language')
+
+bereken_icc_rij <- function(wide_mat, dim_naam) {
+  res_C1 <- irr::icc(wide_mat, model = "twoway", type = "consistency", unit = "single")
+  res_A1 <- irr::icc(wide_mat, model = "twoway", type = "agreement",   unit = "single")
+  res_C3 <- irr::icc(wide_mat, model = "twoway", type = "consistency", unit = "average")
+  res_A3 <- irr::icc(wide_mat, model = "twoway", type = "agreement",   unit = "average")
+
+  tibble::tibble(
+    Dimensie = dim_naam,
+    `ICC(C,1)` = round(res_C1$value, 3),
+    `C1 95% CI` = sprintf("[%.3f, %.3f]", res_C1$lbound, res_C1$ubound),
+    `ICC(A,1)` = round(res_A1$value, 3),
+    `A1 95% CI` = sprintf("[%.3f, %.3f]", res_A1$lbound, res_A1$ubound),
+    `ICC(C,3)` = round(res_C3$value, 3),
+    `C3 95% CI` = sprintf("[%.3f, %.3f]", res_C3$lbound, res_C3$ubound),
+    `ICC(A,3)` = round(res_A3$value, 3),
+    `A3 95% CI` = sprintf("[%.3f, %.3f]", res_A3$lbound, res_A3$ubound)
+  )
+}
+
+icc_analyse <- function(data_long) {
+  resultaten <- lapply(dimensies, function(dim) {
+    wide <- data_long %>%
+      select(Case, Beoordelaar, all_of(dim)) %>%
+      pivot_wider(names_from = Beoordelaar, values_from = all_of(dim)) %>%
+      select(-Case) %>%
+      as.data.frame()
+
+    bereken_icc_rij(wide, dim_naam = dim)
+  })
+
+  overall_wide <- data_long %>%
+    mutate(Overall = rowMeans(across(all_of(dimensies)), na.rm = TRUE)) %>%
+    select(Case, Beoordelaar, Overall) %>%
+    pivot_wider(names_from = Beoordelaar, values_from = Overall) %>%
+    select(-Case) %>%
+    as.data.frame()
+
+  overall_rij <- bereken_icc_rij(overall_wide, dim_naam = "Overall (mean)")
+
+  bind_rows(resultaten, overall_rij)
+}
+```
+
+## ICC – Expert
+```{r}
+icc_expert <- icc_analyse(data_expert_format)
+
+knitr::kable(
+  icc_expert,
+  caption = "ICC for human experts (n = 6)"
+)
+```
+
+## ICC - LLM
+```{r}
+data_llm_format <- data_llm %>%
+  mutate(across(all_of(dimensies), as.numeric))
+
+modellen <- unique(data_llm_format$Beoordelaar)
+```
+
+```{r}
+icc_llm_alle <- icc_analyse(data_llm_format)
+
+knitr::kable(
+  icc_llm_alle,
+  caption = "ICC for LLMs"
+)
+```
+
+### without Llama
+```{r}
+data_llm_zonder_llama <- data_llm_format %>%
+  filter(!grepl("llama", Beoordelaar, ignore.case = TRUE))
+
+icc_llm_zonder_llama <- icc_analyse(data_llm_zonder_llama)
+
+knitr::kable(
+  icc_llm_zonder_llama,
+  caption = "ICC for LLMs without Llama 3.1 8B"
+)
+```
+
+
+## Comparison expert and LLM
+
+```{r}
+samenvatting <- bind_rows(
+  icc_expert %>% mutate(Groep = "Experts (n=6)", .before = 1),
+  icc_llm_alle  %>% mutate(Groep = "LLMs – alle 4 modellen", .before = 1),
+  icc_llm_zonder_llama %>% mutate(Groep = "LLMs – zonder Llama 3.1 8B (n=3)", .before = 1)
+)
+
+knitr::kable(
+  samenvatting,
+  caption = "Comparison of ICC values"
+)
+```
+
+# more descriptives
+
+## expert
+```{r}
+expert_gem <- data_expert_format %>%
+  group_by(Case) %>%
+  summarise(across(all_of(dimensies),
+                   ~ mean(.x, na.rm = TRUE),
+                   .names = "expert_{.col}"),
+            .groups = "drop")
+```
+
+```{r}
+model_type <- tibble(
+  Beoordelaar = unique(data_llm_format$Beoordelaar),
+  Model_type  = ifelse(
+    grepl("llama", unique(data_llm_format$Beoordelaar), ignore.case = TRUE),
+    "Lokaal model",
+    "Groot model"
+  )
+)
+
+data_llm_format <- data_llm_format %>%
+  left_join(model_type, by = "Beoordelaar")
+```
+
+# bias from expert average
+```{r}
+bias_long <- data_llm_format %>%
+  left_join(expert_gem, by = "Case") %>%
+  mutate(
+    across(
+      all_of(dimensies),
+      ~ .x - get(paste0("expert_", cur_column())),
+      .names = "bias_{.col}"
+    )
+  )
+
+bias_long <- bias_long %>%
+  rowwise() %>%
+  mutate(bias_Totaal = mean(c_across(starts_with("bias_")), na.rm = TRUE)) %>%
+  ungroup()
+
+bias_tabel <- bias_long %>%
+  group_by(Beoordelaar, Model_type) %>%
+  summarise(
+    across(
+      starts_with("bias_"),
+      list(
+        gem = ~ round(mean(.x, na.rm = TRUE), 3),
+        sd = ~ round(sd(.x,   na.rm = TRUE), 3)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+grote_modellen_rij <- bias_long %>%
+  filter(Model_type == "Groot model") %>%
+  summarise(
+    across(
+      starts_with("bias_"),
+      list(
+        gem = ~ round(mean(.x, na.rm = TRUE), 3),
+        sd = ~ round(sd(.x,   na.rm = TRUE), 3)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Beoordelaar = "Gemiddelde Grote Modellen",
+    Model_type = "Groot model"
+  )
+
+bias_tabel <- bind_rows(bias_tabel, grote_modellen_rij) %>%
+  select(Beoordelaar, Model_type, ends_with("_gem"), ends_with("_sd"))
+
+knitr::kable(
+  bias_tabel
+)
+```
+
+
+# spearman
+```{r}
+expert_loo <- data_expert_format %>%
+  group_by(Case) %>%
+  mutate(
+    n_raters = n(),
+    across(
+      all_of(dimensies),
+      ~ (sum(.x, na.rm = TRUE) - .x) / (n_raters - 1),
+      .names = "loo_{.col}"
+    )
+  ) %>%
+  ungroup()
+
+# Spearman per expert againt LOO
+spearman_expert <- expert_loo %>%
+  group_by(Beoordelaar) %>%
+  summarise(
+    across(
+      all_of(dimensies),
+      ~ cor.test(.x, get(paste0("loo_", cur_column())),
+                 method = "spearman", exact = FALSE)$estimate,
+      .names = "rho_{.col}"
+    ),
+    rho_Overall = cor.test(
+      rowMeans(across(all_of(dimensies)), na.rm = TRUE),
+      rowMeans(across(all_of(paste0("loo_", dimensies))), na.rm = TRUE),
+      method = "spearman", exact = FALSE
+    )$estimate,
+    Model_type = "Experts",
+    .groups = "drop"
+  )
+
+# Spearman per LLM against expert average
+spearman_llm <- data_llm_format %>%
+  left_join(expert_gem, by = "Case") %>%
+  group_by(Beoordelaar, Model_type) %>%
+  summarise(
+    across(
+      all_of(dimensies),
+      ~ cor.test(.x, get(paste0("expert_", cur_column())),
+                 method = "spearman", exact = FALSE)$estimate,
+      .names = "rho_{.col}"
+    ),
+    rho_Overall = cor.test(
+      rowMeans(across(all_of(dimensies)), na.rm = TRUE),
+      rowMeans(across(all_of(paste0("expert_", dimensies))), na.rm = TRUE),
+      method = "spearman", exact = FALSE
+    )$estimate,
+    .groups = "drop"
+  )
+
+# Combineren
+spearman_alle <- bind_rows(spearman_expert, spearman_llm) %>%
+  mutate(
+    Model_type  = factor(Model_type,
+                         levels = c("Experts", "Groot model", "Lokaal model")),
+    Beoord_kort = case_when(
+      Model_type == "Experts"                                 ~ paste0("E", Beoordelaar),
+      grepl("gemini", Beoordelaar, ignore.case = TRUE) ~ "Gemini",
+      grepl("claude|sonnet", Beoordelaar, ignore.case = TRUE) ~ "Claude",
+      grepl("gpt", Beoordelaar, ignore.case = TRUE) ~ "GPT-4o",
+      grepl("llama", Beoordelaar, ignore.case = TRUE) ~ "Llama",
+      TRUE ~ Beoordelaar
+    )
+  )
+
+knitr::kable(
+  spearman_alle %>%
+    select(Beoordelaar, Model_type, starts_with("rho_")) %>%
+    arrange(Model_type, desc(rho_Overall)),
+  digits = 3
+)
+```
+
+# heatmap of spearman
+```{r}
+heatmap_data <- spearman_alle %>%
+  select(Beoordelaar, Model_type, Beoord_kort, starts_with("rho_")) %>%
+  pivot_longer(cols = starts_with("rho_"),
+               names_to = "Dimensie",
+               values_to = "rho") %>%
+  mutate(
+    Dimensie = sub("^rho_", "", Dimensie),
+    Model_type = factor(Model_type,
+                        levels = c("Experts", "Groot model", "Lokaal model"),
+                        labels = c("Experts", "Large", "Local"))
+  )
+
+ggplot(heatmap_data, aes(x = Dimensie, y = Beoord_kort, fill = rho)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", rho)),
+            size = 3.2, colour = "black") +
+  scale_fill_gradient2(
+    low = "#687c8f",
+    mid = "white",
+    high = "#bc4242",
+    midpoint = 0.5,
+    limits = c(0, 1),
+    oob = scales::squish,
+    name = "Spearman rho"
+  ) +
+  facet_grid(Model_type ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title = "Spearman rho per rater and dimension",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "grey90", colour = NA),
+    strip.text = element_text(face = "bold", size = 9),
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    plot.title = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9, colour = "grey40"),
+    legend.key.width = unit(1.5, "cm")
+  )
+```
+
+
