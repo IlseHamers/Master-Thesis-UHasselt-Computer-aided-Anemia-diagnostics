@@ -1,0 +1,548 @@
+---
+title: "Data_cleaning_thesis"
+author: "Ilse Hamers"
+date: "2026-02-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# readme
+This script cleans and reshapes the data extracted directly from the lab system. Sample IDs are removed from this script to protect patient privacy.
+
+## Libraries
+```{r}
+library(tidyr)
+library(readr)
+library(dplyr)
+library(writexl)
+library(readxl)
+library(strinr)
+```
+
+## loading the data
+```{r}
+file_path <- Sys.getenv("ANEMIA_DATA_PATH", unset = "Data/anemie_data_extract_31DCE1D2.csv")
+
+columns_to_keep <- c("Geslacht", "Leeftijd", "UniekLabnummer", 
+                     "Testcode", "test", "resultaat", "eenheid", "Patientnummer")
+
+data <- read_csv(file_path, col_select = all_of(columns_to_keep))
+length(unique(data$UniekLabnummer))
+```
+
+## checking
+```{r}
+unique(data$test)
+```
+
+## filter relevant tests
+```{r}
+values_to_keep <- c(
+  "HB",
+  "LEUC",
+  "CRPSE",
+  "BSE", # bezinking
+  "MCV",
+  "ANE", # anemie protocol
+  "NFERSE", # ferritine
+  "VB12SE", # vitamine b12
+  "HT", # hematocriet
+  "ALTSE", # ALAT
+  "KRESE", # kreatinine
+  "NFOLSE", # foliumzuur
+  "CKDESE", # eGFR
+  "YZESE", # ijzer
+  "TFSSE", # transf. sat.
+  "TRFSE", # transferrine
+  "TRC", # trombocyten
+  "RTC", # reticulocyten relatief
+  "PBNPSE", # NT-proBNP
+  "LDSE", # LD
+  "ARTC", # reticulocyten absoluut
+  "ERY", # erytrocyten
+  "HPTSE", # haptoglobine
+  "OKC", # Opm.vakspec.
+  "HOVS", #Opm. Laboratoriumspecialist
+  "NTSHSE" # tsh
+)
+
+data_filtered <- data %>%
+  filter(Testcode %in% values_to_keep) %>%
+  select(-Testcode)
+
+length(values_to_keep)
+length(unique(data_filtered$test))
+```
+
+# Cases with anemia
+
+```{r}
+geen_anemie_ids <- data_filtered %>%
+  filter(test == "Anemie protocol", resultaat == "Geen anemie.") %>%
+  pull(UniekLabnummer) %>%
+  unique()
+
+data_anemie <- data_filtered %>%
+  filter(!UniekLabnummer %in% geen_anemie_ids)
+
+length(unique(data_anemie$UniekLabnummer))
+```
+
+## remove cases without usable results
+```{r}
+# cases without results
+ongewenste_ids <- data_filtered %>%
+  filter(test == "Anemie protocol", resultaat %in% c(
+    "Geen materiaal ontvangen op het laboratorium.",
+    "Materiaal gestold, aanvraag opnieuw insturen",
+    "Materiaal gestold. Telefonisch gemeld",
+    "Niet te beoordelen"
+  )) %>%
+  pull(UniekLabnummer) %>%
+  unique()
+
+data_filtered <- data_filtered %>%
+  filter(!UniekLabnummer %in% ongewenste_ids)
+
+length(unique(data_filtered$UniekLabnummer))
+
+# cases where hb is not measured
+geen_numeriek_hb_ids <- data_filtered %>%
+  filter(test == "Hemoglobine") %>%
+  filter(is.na(suppressWarnings(as.numeric(resultaat)))) %>%
+  pull(UniekLabnummer) %>%
+  unique()
+
+data_filtered <- data_filtered %>%
+  filter(!UniekLabnummer %in% geen_numeriek_hb_ids)
+
+length(unique(data_filtered$UniekLabnummer))
+```
+
+```{r}
+head(data_filtered)
+```
+
+# inspect all potential conclusion fields
+```{r}
+data_filtered %>%
+  filter(test == "Anemie protocol") %>%
+  count(resultaat, sort = TRUE)
+
+data_filtered %>%
+  filter(test == "Opm.vakspec.") %>%
+  count(resultaat, sort = TRUE)
+
+data_filtered %>%
+  filter(test == "Opm. laboratoriumspecialist") %>%
+  count(resultaat, sort = TRUE)
+```
+
+```{r}
+# remove Anemie protocol = TEKST en (C)
+data_filtered <- data_filtered %>%
+  filter(!(test == "Anemie protocol" & resultaat %in% c("TEKST", "(C)")))
+
+data_filtered %>%
+  filter(test == "Anemie protocol") %>%
+  count(resultaat, sort = TRUE)
+
+# same for opm.vakspec.
+data_filtered <- data_filtered %>%
+  filter(!(test == "Opm.vakspec." & resultaat %in% c("TEKST", "(C)", "\n\r\r\n\r\r\n\r\r\n")))
+
+data_filtered %>%
+  filter(test == "Opm.vakspec.") %>%
+  count(resultaat, sort = TRUE)
+
+# ...and opm. laboratoriumspecialist
+data_filtered <- data_filtered %>%
+  filter(!(test == "Opm. laboratoriumspecialist" & resultaat %in% c("TEKST", "(C)")))
+
+data_filtered %>%
+  filter(test == "Opm. laboratoriumspecialist") %>%
+  count(resultaat, sort = TRUE)
+```
+
+# check
+```{r}
+data_filtered %>%
+  group_by(UniekLabnummer, test) %>%
+  summarise(n_rijen = n(), .groups = "drop") %>%
+  filter(n_rijen > 1) %>%
+  arrange(UniekLabnummer, test)
+```
+
+# check if there's cases with both opm.vakspec. and opm. laboratoriumspecialist
+```{r}
+aantal_beide <- data_filtered %>%
+  group_by(UniekLabnummer) %>%
+  summarise(
+    beide_aanwezig = all(c("Opm.vakspec.", "Opm. laboratoriumspecialist") %in% test)
+  ) %>%
+  filter(beide_aanwezig) %>%
+  nrow()
+
+aantal_beide
+```
+
+# merge double anemia protocol rows
+```{r}
+anemie <- data_filtered %>%
+  filter(test == "Anemie protocol") %>%
+  group_by(UniekLabnummer) %>%
+  summarise(
+    Geslacht   = first(Geslacht),
+    Leeftijd   = first(Leeftijd),
+    test       = first(test),
+    resultaat  = paste(resultaat, collapse = " - "),
+    .groups    = "drop"
+  )
+
+niet_anemie <- data_filtered %>%
+  filter(test != "Anemie protocol")
+
+data_filtered <- bind_rows(niet_anemie, anemie)
+```
+
+# check
+```{r}
+data_filtered %>%
+  group_by(UniekLabnummer, test) %>%
+  summarise(n_rijen = n(), .groups = "drop") %>%
+  filter(n_rijen > 1) %>%
+  arrange(UniekLabnummer, test)
+
+data_filtered %>%
+  group_by(UniekLabnummer, test) %>%
+  summarise(n_rijen = n(), .groups = "drop") %>%
+  filter(n_rijen > 1) %>%
+  pull(test) %>% 
+  unique()
+```
+
+#  fix up duplicates of other tests
+```{r}
+is_numeric_resultaat <- function(x) grepl("^\\s*-?\\d*[.,]?\\d+\\s*$", x)
+bevat_cijfer <- function(x) grepl("\\d", x)
+
+data_filtered <- data_filtered %>%
+  group_by(UniekLabnummer, test) %>%
+  mutate(
+    heeft_cijfer = any(is_numeric_resultaat(resultaat)),
+    heeft_tekst  = any(!is_numeric_resultaat(resultaat)),
+    alle_tekst_zonder_cijfer = all(!bevat_cijfer(resultaat))
+  ) %>%
+  filter(
+    # if both numerical and text: remove text row
+    !(heeft_cijfer & heeft_tekst & !is_numeric_resultaat(resultaat))
+  ) %>%
+  mutate( # if exact duplicate rows: keep first row
+    alle_identiek = n_distinct(resultaat) == 1
+  ) %>%
+  filter(!(alle_identiek & duplicated(resultaat))) %>%
+  # if all rows are text: make first row = "Geen resultaat" and remove others
+  mutate(
+    resultaat = if_else(
+      alle_tekst_zonder_cijfer & n() > 1 & row_number() == 1,
+      "Geen resultaat",
+      resultaat
+    )
+  ) %>%
+  filter(!(alle_tekst_zonder_cijfer & n() > 1 & row_number() > 1)) %>%
+  select(-heeft_cijfer, -heeft_tekst, -alle_tekst_zonder_cijfer, -alle_identiek) %>%
+  ungroup()
+```
+
+# check
+```{r}
+data_filtered %>%
+  group_by(UniekLabnummer, test) %>%
+  summarise(n_rijen = n(), .groups = "drop") %>%
+  filter(n_rijen > 1) %>%
+  arrange(UniekLabnummer, test)
+```
+
+# trombocytes duplicates
+(can have both a >x and a text field)
+```{r}
+data_filtered <- data_filtered %>%
+  group_by(UniekLabnummer, test) %>%
+  mutate(
+    resultaat = if_else(
+      test == "Trombocyten" & n() > 1,
+      paste(
+        resultaat[grepl("^>", resultaat)],
+        resultaat[!grepl("^>", resultaat)],
+        sep = " - "
+      ),
+      resultaat
+    )
+  ) %>%
+  filter(!(test == "Trombocyten" & duplicated(UniekLabnummer))) %>%
+  ungroup()
+```
+
+# Make one uniform conclusion column (Beschrijving)
+(Opm.vakspec. else Anemie protocol --> or opm. laboratoriumspecialist else anemie protocol)
+```{r}
+beschrijving_rows <- data_filtered %>%
+  filter(test %in% c("Anemie protocol", "Opm.vakspec.", "Opm. laboratoriumspecialist")) %>%
+  group_by(UniekLabnummer) %>%
+  summarise(
+    resultaat = case_when(
+      any(test == "Opm.vakspec." & !is.na(resultaat) & resultaat != "") ~ 
+        resultaat[test == "Opm.vakspec." & !is.na(resultaat) & resultaat != ""][1],
+      
+      any(test == "Opm. laboratoriumspecialist" & !is.na(resultaat) & resultaat != "") ~ 
+        resultaat[test == "Opm. laboratoriumspecialist" & !is.na(resultaat) & resultaat != ""][1],
+      
+      any(test == "Anemie protocol" & !is.na(resultaat) & resultaat != "") ~ 
+        resultaat[test == "Anemie protocol" & !is.na(resultaat) & resultaat != ""][1],
+      
+      TRUE ~ NA_character_
+    ),
+    Geslacht = Geslacht[test == "Anemie protocol"][1],
+    Leeftijd = Leeftijd[test == "Anemie protocol"][1],
+    .groups = "drop"
+  ) %>%
+  mutate(test = "Beschrijving")
+
+missing_cols <- setdiff(names(data_filtered), names(beschrijving_rows))
+for (col in missing_cols) {
+  beschrijving_rows[[col]] <- NA
+}
+
+beschrijving_rows <- beschrijving_rows[, names(data_filtered)]
+data_filtered <- bind_rows(data_filtered, beschrijving_rows)
+```
+```{r}
+# drop opmerkingen
+data_filtered <- data_filtered %>%
+ filter(!(test %in% c("Opm. laboratoriumspecialist", "Opm.vakspec.")))
+```
+
+```{r}
+beschrijving_counts <- data_filtered %>%
+  filter(test == "Beschrijving") %>%
+  count(resultaat, sort = TRUE) %>%
+  filter(n > 0)
+
+beschrijving_counts
+```
+
+# Remove conclusion author names
+Author names were seen in the following configurations:
+- "Datum opmerking : ... Laboratoriumspecialist : ... ----------"
+- Dr. of dr. of zonder punt
+- J. Jansen of J van Jansen
+- J. Jansen, AIOS Klinische Chemie
+- J. Jansen Klinisch Chemicus
+- J. Jansen, KCIO aan begin
+- J. Jansen, AIOS
+
+```{r}
+# copy so can compare
+data_zAuteur <- data_filtered
+```
+
+### 'Datum opmerking : .... Laboratoriumspecialist : ... ----------'
+```{r}
+patroon_Datum <- "(?s)^\\s*(Datum opmerking :|Datum consult :).*?\\-{10,}\\s*"
+
+data_zAuteur$resultaat <- ifelse(
+  data_zAuteur$test == "Beschrijving",
+  str_replace(data_zAuteur$resultaat, patroon_Datum, ""),
+  data_zAuteur$resultaat
+)
+```
+
+### Eindigend met "Jan van Jansen, laboratoriumspecialist"
+```{r}
+patroon_specialist <- "\n[^\n]*[A-Z][a-z]+,\\s*laboratoriumspecialist(?s).*$"
+
+data_zAuteur$resultaat <- ifelse(
+  data_zAuteur$test == "Beschrijving",
+  str_remove(data_zAuteur$resultaat, patroon_specialist),
+  data_zAuteur$resultaat
+)
+```
+
+### Dr. dr. en Dr 
+```{r}
+patroon_dr_punt <- "(?i)(\\n|\\.)\\s*dr\\.?\\s+[^\n]*[\\s\\r\\n]*$"
+
+data_zAuteur$resultaat <- ifelse(
+  data_zAuteur$test == "Beschrijving",
+  str_remove(data_zAuteur$resultaat, patroon_dr_punt),
+  data_zAuteur$resultaat
+)
+```
+
+### klinisch chemicus en klinische chemie
+```{r}
+patroon_chemi_nl <- "(?i)\n.*(chemie|chemicus).*"
+
+data_zAuteur$resultaat <- ifelse(
+  data_zAuteur$test == "Beschrijving",
+  str_remove(data_zAuteur$resultaat, patroon_chemi_nl),
+  data_zAuteur$resultaat
+)
+
+patroon_chemi_direct <- "(?i)\\.[^.]*(chemie|chemicus)[\\s\\S]*$"
+
+data_zAuteur$resultaat <- ifelse(
+  data_zAuteur$test == "Beschrijving" & str_detect(data_zAuteur$resultaat, patroon_chemi_direct),
+  str_replace(data_zAuteur$resultaat, patroon_chemi_direct, "."),
+  data_zAuteur$resultaat
+)
+```
+
+### , AIOS (eind) of , KCIO (start)
+```{r}
+patroon_aios_nl <- "(?i)\n.*AIOS.*"
+
+data_zAuteur$resultaat <- ifelse(
+  data_zAuteur$test == "Beschrijving",
+  str_remove(data_zAuteur$resultaat, patroon_aios_nl),
+  data_zAuteur$resultaat
+)
+
+patroon_kcio_start <- "(?i)^[^\n]*KCIO[^\n]*\n+"
+
+data_zAuteur$resultaat <- ifelse(
+  data_zAuteur$test == "Beschrijving",
+  str_remove(data_zAuteur$resultaat, patroon_kcio_start),
+  data_zAuteur$resultaat
+)
+```
+
+# conclusions < 15 words removed
+```{r}
+uitzonderingen <- c("Geen anemie.")
+
+ids_te_kort <- data_zAuteur %>%
+  filter(test == "Beschrijving") %>%
+  filter(!(resultaat %in% uitzonderingen) & str_count(resultaat, "\\S+") < 15) %>%
+  pull(UniekLabnummer)
+
+data_zAuteur <- data_zAuteur %>%
+  filter(!UniekLabnummer %in% ids_te_kort)
+```
+```{r}
+beschrijving_counts <- data_zAuteur %>%
+  filter(test == "Beschrijving") %>%
+  count(resultaat, sort = TRUE) %>%
+  filter(n > 0)
+
+beschrijving_counts
+```
+
+# to wide format
+Unit added to test name so we can pivot
+```{r}
+data_zAuteur <- data_zAuteur %>%
+  mutate(test = case_when(
+    !is.na(eenheid) & eenheid != "" ~ paste0(test, " (", eenheid, ")"),
+    TRUE ~ test
+  ))
+
+data_zAuteur <- data_zAuteur %>%
+  select(-eenheid)
+```
+
+```{r}
+data_wide <- data_zAuteur %>%
+  pivot_wider(
+    names_from = test, 
+    values_from = resultaat
+  )
+
+data_wide<- data_wide %>%
+  group_by(UniekLabnummer) %>%
+  summarise(
+    # take a not empty value to keep
+    Leeftijd = first(na.omit(Leeftijd)),
+    Geslacht = first(na.omit(Geslacht)),
+    
+    # not empty
+    `Anemie protocol` = first(na.omit(`Anemie protocol`)),
+    Beschrijving = first(na.omit(Beschrijving)),
+    
+    across(everything(), ~ first(na.omit(.x)))
+  ) %>%
+  ungroup()
+```
+
+## remove patient duplicates
+```{r}
+dubbele_patienten <- data_wide %>%
+  count(Patientnummer) %>%
+  filter(n > 1) %>%
+  nrow()
+
+dubbele_patienten
+
+dubbele_patienten_geenanemie <- data_wide %>%
+  group_by(Patientnummer) %>%
+  filter(n() > 1) %>%
+  filter(Beschrijving == "Geen anemie.") %>%
+  ungroup() %>%
+  distinct(Patientnummer) %>%
+  nrow()
+
+dubbele_patienten_geenanemie
+
+data_wide <- data_wide %>%
+  mutate(is_anemie = ifelse(Beschrijving == "Geen anemie.", 1, 0)) %>%
+  group_by(Patientnummer) %>%
+  arrange(is_anemie, desc(UniekLabnummer)) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  select(-is_anemie)
+
+data_wide <- data_wide %>%
+  select(-Patientnummer)
+```
+
+
+
+# export to csv
+```{r}
+write.csv(data_wide, "data_clean_wide.csv", row.names = FALSE)
+```
+
+
+# QLoRA training set export without test cases
+```{r}
+labnummers_lijst <- c(
+) # censored
+
+data_zTest <- data_wide %>%
+  filter(!UniekLabnummer %in% labnummers_lijst) %>%
+  select(-'Anemie protocol')
+
+anemie_groep <- data_zTest %>% filter(Beschrijving != "Geen anemie.")
+geen_anemie_groep <- data_zTest %>% filter(Beschrijving == "Geen anemie.")
+
+set.seed(42)
+geen_anemie_groep <- geen_anemie_groep %>% sample_n(53) # 10% van de dataset
+
+data_QLoRA <- bind_rows(anemie_groep, geen_anemie_groep)
+data_QLoRA <- data_QLoRA %>%
+  mutate(Beschrijving = str_replace_all(Beschrijving, "\r\n|\r", "\n"))
+
+```
+```{r}
+write_xlsx(data_QLoRA, "data_QLoRA.xlsx")
+```
+
+
+
+
+
+
+
