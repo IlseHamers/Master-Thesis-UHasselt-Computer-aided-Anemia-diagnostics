@@ -1,0 +1,331 @@
+---
+title: "eindevaluatie_thesis"
+author: "Ilse Hamers"
+date: "2026-06-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# README
+Script to analyse the survey results of the final validation
+
+## Libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(irr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ordinal)
+library(stringr)
+library(purrr)
+library(readr)
+```
+
+# data
+```{r}
+data_dir <- Sys.getenv("ANEMIA_DATA_DIR", unset = "data")
+
+pad_mapping <- file.path(data_dir,"CASTOR\\castor_clinical_validation_Eindevaluatie_step_mapping.csv")
+export_pad <- file.path(data_dir,"CASTOR\\ANEMIA-LLM_Eindevaluatie_export_20260613.csv")
+
+df_map <- read.csv(pad_mapping) %>%
+  mutate(UniekLabnummer = str_extract(case_raw, "\\d+")) %>%
+  distinct(casus_nr, UniekLabnummer)
+df_wide <- read_csv2(export_pad)
+```
+```{r}
+df_wide <- df_wide %>%
+  mutate(beoordelaar = case_when(
+    `Castor Participant ID` == 110006 ~ "B1",
+    `Castor Participant ID` == 110007 ~ "B2",
+    `Castor Participant ID` == 110008 ~ "B3",
+  )) %>%
+  select(-`Castor Participant ID`)
+```
+
+# wide to long, neater labels
+```{r}
+score_cols_likert <- names(df_wide)[str_detect(
+  names(df_wide),
+  "^eindevaluatie_casus\\d+_[abc]_(correctheid|nuance|databasering|format|taalgebruik)$"
+)]
+
+df_lang <- df_wide %>%
+  select(beoordelaar, all_of(score_cols_likert)) %>%
+  pivot_longer(cols = all_of(score_cols_likert),
+               names_to = "variabele",
+               values_to = "score") %>%
+  mutate(
+    casus_nr = as.integer(str_extract(variabele, "(?<=casus)\\d+")),
+    letter = str_extract(variabele, "casus\\d+_([abc])_", group = 1),
+    factor = str_extract(variabele, "[^_]+$")
+  ) %>%
+  select(beoordelaar, casus_nr, letter, factor, score) %>%
+  left_join(df_map, by = "casus_nr")
+
+df_lang <- df_lang %>%
+  mutate(
+    bron = case_when(
+      letter == "a" ~ "Decision tree",
+      letter == "b" ~ "Human expert",
+      letter == "c" ~ "LLM"
+    ),
+    factor = case_when(
+      factor == "correctheid" ~ "Clinical correctness",
+      factor == "nuance" ~ "Nuance",
+      factor == "databasering" ~ "Hallucination",
+      factor == "format" ~ "Format",
+      factor == "taalgebruik" ~ "Language"
+    )
+  )
+
+factor_volgorde <- c("Clinical correctness", "Nuance", "Hallucination", "Format", "Language")
+bron_volgorde   <- c("Decision tree", "Human expert", "LLM")
+
+df_lang <- df_lang %>%
+  mutate(
+    factor = factor(factor, levels = factor_volgorde),
+    bron   = factor(bron, levels = bron_volgorde),
+    score  = as.integer(score)
+  )
+
+print(table(df_lang$bron, df_lang$factor))
+```
+
+# ICC
+```{r}
+factoren <- levels(df_lang$factor)
+
+icc_per_factor <- map_dfr(factoren, function(f) {
+
+  mat_f <- df_lang %>%
+    filter(factor == f) %>%
+    mutate(item_id = paste(UniekLabnummer, bron, sep = "_")) %>%
+    select(beoordelaar, item_id, score) %>%
+    pivot_wider(names_from = beoordelaar, values_from = score) %>%
+    select(B1, B2, B3)
+
+  a_s <- icc(mat_f, model = "twoway", type = "agreement",   unit = "single")
+  a_a <- icc(mat_f, model = "twoway", type = "agreement",   unit = "average")
+  c_s <- icc(mat_f, model = "twoway", type = "consistency", unit = "single")
+  c_a <- icc(mat_f, model = "twoway", type = "consistency", unit = "average")
+
+  tibble(
+    factor = f,
+    `ICC(A,1)` = round(a_s$value, 3),
+    `ICC(A,1) CI` = sprintf("[%.3f, %.3f]", a_s$lbound, a_s$ubound),
+    `ICC(A,k)` = round(a_a$value, 3),
+    `ICC(A,k) CI` = sprintf("[%.3f, %.3f]", a_a$lbound, a_a$ubound),
+    `ICC(C,1)` = round(c_s$value, 3),
+    `ICC(C,1) CI` = sprintf("[%.3f, %.3f]", c_s$lbound, c_s$ubound),
+    `ICC(C,k)` = round(c_a$value, 3),
+    `ICC(C,k) CI` = sprintf("[%.3f, %.3f]", c_a$lbound, c_a$ubound)
+  )
+})
+print(icc_per_factor)
+```
+
+# plots per factor (not used in thesis) and cumulative
+```{r}
+bron_kleuren <- c(
+  "Decision tree" = "#e08282",
+  "Human expert"  = "#bc4242",
+  "LLM"           = "#2c3e50"
+)
+
+for (f in factoren) {
+  df_sub <- df_lang %>% filter(factor == f)
+
+  p <- ggplot(df_sub, aes(x = bron, y = score, fill = bron)) +
+    geom_boxplot(alpha = 0.9, outlier.size = 1.5) +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 2.5, fill = "white") +
+    labs(title = paste("Scores per source for:", f), x = "Source", y = "Score") +
+    scale_fill_manual(values = bron_kleuren) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+          panel.grid.minor = element_blank(),
+          axis.title = element_text(face = "bold"),
+          legend.position = "none") +
+    scale_y_continuous(breaks = 1:5)
+
+  print(p)
+}
+
+df_totaal <- df_lang %>%
+  group_by(beoordelaar, casus_nr, UniekLabnummer, bron) %>%
+  summarise(totaalscore = sum(score, na.rm = TRUE), .groups = "drop")
+
+p_totaal <- ggplot(df_totaal, aes(x = bron, y = totaalscore, fill = bron)) +
+  geom_boxplot(alpha = 0.9, outlier.size = 1.5) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 2.5, fill = "white") +
+  labs(title = "Total cumulative score by conclusion source",
+       x = "Source", y = "Total Score") +
+  scale_fill_manual(values = bron_kleuren) +
+  theme_minimal() +
+  theme(plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+        panel.grid.minor = element_blank(),
+        axis.title       = element_text(face = "bold"),
+        legend.position  = "none") +
+  scale_y_continuous(breaks = seq(5, 25, by = 2))
+
+print(p_totaal)
+```
+# (C)LMM
+```{r}
+clmm_resultaten <- list()
+
+for (f in factoren) {
+  df_sub <- df_lang %>%
+    filter(factor == f) %>%
+    mutate(score = factor(score, ordered = TRUE))
+
+  cat("\n", strrep("=", 60), "\n")
+  cat("Factor:", f, "\n")
+  cat(strrep("=", 60), "\n")
+
+  model <- clmm(
+    score ~ bron + (1 | UniekLabnummer) + (1 | beoordelaar),
+    data = df_sub,
+    link = "logit"
+  )
+
+  clmm_resultaten[[f]] <- model
+  print(summary(model))
+}
+```
+```{r}
+df_totaal_lmm <- df_lang %>%
+  group_by(beoordelaar, casus_nr, UniekLabnummer, bron) %>%
+  summarise(totaalscore = sum(score, na.rm = TRUE), .groups = "drop")
+
+model_totaal_lmm <- lmer(
+  totaalscore ~ bron + (1 | UniekLabnummer) + (1 | beoordelaar),
+  data = df_totaal_lmm
+)
+
+summary(model_totaal_lmm)
+
+par(mfrow = c(1, 2))
+plot(fitted(model_totaal_lmm), resid(model_totaal_lmm),
+     xlab = "Fitted", ylab = "Residuals", main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+qqnorm(resid(model_totaal_lmm), main = "Q-Q plot residuals")
+qqline(resid(model_totaal_lmm), col = "red")
+par(mfrow = c(1, 1))
+```
+
+# emmeans
+```{r}
+# Per factor
+for (f in factoren) {
+  cat("\n", strrep("=", 60), "\n")
+  cat("Post-hoc:", f, "\n")
+  cat(strrep("=", 60), "\n")
+
+  emm_bron <- emmeans(clmm_resultaten[[f]], ~ bron, mode = "latent")
+  print(pairs(emm_bron, adjust = "bonferroni"))
+}
+
+# Totaal
+em_bron <- emmeans(model_totaal_lmm, pairwise ~ bron, adjust = "bonferroni")
+print(em_bron$emmeans)
+print(em_bron$contrasts)
+```
+
+# ranking
+```{r}
+rank_cols <- names(df_wide)[str_detect(
+  names(df_wide),
+  "^eindevaluatie_casus\\d+_rank_[abc]$"
+)]
+
+df_rank <- df_wide %>%
+  select(beoordelaar, all_of(rank_cols)) %>%
+  pivot_longer(cols = all_of(rank_cols),
+               names_to = "variabele", values_to = "rang") %>%
+  mutate(
+    casus_nr = as.integer(str_extract(variabele, "(?<=casus)\\d+")),
+    letter   = str_extract(variabele, "[abc]$"),
+    bron = case_when(
+      letter == "a" ~ "Decision tree",
+      letter == "b" ~ "Human expert",
+      letter == "c" ~ "LLM"
+    )
+  ) %>%
+  left_join(df_map, by = "casus_nr") %>%
+  mutate(bron = factor(bron, levels = bron_volgorde),
+         rang = as.integer(rang)) %>%
+  filter(!is.na(rang))
+
+df_rank %>%
+  group_by(beoordelaar, casus_nr) %>%
+  summarise(ok = setequal(rang, 1:3), .groups = "drop") %>%
+  count(ok)
+```
+
+```{r}
+tabel_ranking <- df_rank %>%
+  group_by(bron) %>%
+  summarise(
+    Gem_rang = round(mean(rang), 2),
+    SD_rang = round(sd(rang), 2),
+    Pct_1e = round(mean(rang == 1) * 100, 1),
+    Pct_2e = round(mean(rang == 2) * 100, 1),
+    Pct_3e = round(mean(rang == 3) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(Gem_rang)
+
+print(tabel_ranking)
+```
+
+# friedman
+```{r}
+rang_wide <- df_rank %>%
+  mutate(blok = paste(beoordelaar, UniekLabnummer, sep = "_")) %>%
+  select(blok, bron, rang) %>%
+  pivot_wider(names_from = bron, values_from = rang) %>%
+  select(-blok) %>%
+  as.matrix()
+
+friedman.test(rang_wide)
+
+library(PMCMRplus)
+
+rownames(rang_wide) <- paste0("blok_", seq_len(nrow(rang_wide)))
+
+nemenyi <- PMCMRplus::frdAllPairsNemenyiTest(rang_wide)
+nemenyi
+```
+
+# heatmap
+```{r}
+win_grid <- expand_grid(rij = bron_volgorde, kol = bron_volgorde) %>%
+  rowwise() %>%
+  mutate(win = if (rij == kol) NA_real_
+               else mean(rang_wide[, rij] < rang_wide[, kol], na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(rij = factor(rij, levels = rev(bron_volgorde)),
+         kol = factor(kol, levels = bron_volgorde))
+
+ggplot(win_grid, aes(kol, rij, fill = win)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = ifelse(is.na(win), "", paste0(round(win * 100), "%"))), size = 4) +
+  scale_fill_gradient2(low = "#2c3e50", mid = "white", high = "#bc4242",
+                       midpoint = 0.5, limits = c(0, 1), na.value = "grey92",
+                       labels = scales::percent, name = "Win rate") +
+  labs(title = "Pairwise win rates between conclusion sources",
+       x = "...ranked above...", y = NULL) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+        panel.grid = element_blank())
+```
+
+
