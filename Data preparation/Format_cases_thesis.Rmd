@@ -1,0 +1,535 @@
+---
+title: "format_cases"
+author: "Ilse Hamers"
+date: "2026-04-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#readme
+This script is used to format test cases for the purpose of:
+- prompting the models
+- creating a visual representation used in the surveys for experts
+
+## Libraries
+```{r warning=FALSE}
+library(webshot2)
+library(dplyr)
+library(flextable)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(readr)
+library(dplyr)
+library(writexl)
+library(readxl)
+```
+
+# data paths
+```{r}
+data_dir <- Sys.getenv("ANEMIA_DATA_DIR", unset = "data")
+
+pad_data        <- file.path(data_dir,"data_clean_wide.csv")
+pad_ref         <- file.path(data_dir,"Referentiewaarden.xlsx")
+pad_uitvoer     <- file.path(data_dir,"10 testcases\\")
+
+pad_judge       <- file.path(data_dir,"LLM-as-a-judge\\LLM as a judge conclusies.xlsx")
+pad_uitvoer_judge <- file.path(data_dir,"LLM-as-a-judge\\")
+```
+
+# Configuration (which columns to remove and which order to display them)
+```{r}
+kolommen_verwijderen <- c(
+  "Anemie protocol", "UniekLabnummer",
+  "Dummy ery (10E12/L)", "Dummy Leuco (10E9/L)",
+  "Dummy trombo (10E9/L)", "Dummy RTC (0/00)", "Dummy BSE (mm)", "Patientnummer",
+  "Protocol (boom)", "Humaan", "LLM"  # final validation only
+)
+ 
+gewenste_volgorde <- c(
+  "UniekLabnummer", "Geslacht", "Leeftijd", "Hemoglobine (mmol/L)", "Hematocriet (L/L)",
+  "MCV (fL)", "Reticulocyten absoluut (10E9/L)", "Reticulocyten relatief (0/00)",
+  "Trombocyten (10E9/L)", "Leucocyten (10E9/L)", "Erytrocyten (10E12/L)",
+  "Bezinking (mm)", "Kreatinine (umol/L)", "eGFR CKD-EPI (mL/min/1.73m)",
+  "ALAT (U/L)", "LD (U/L)", "NT-proBNP (pmol/L)", "Transferrine (g/L)",
+  "Transf.sat. (%)", "Ferritine (ug/L)", "IJzer (umol/L)", "CRP (mg/L)",
+  "Haptoglobine (g/L)", "TSH (mU/L)", "Vitamine B12 (pmol/L)", "Foliumzuur (nmol/L)",
+  "Beschrijving"
+)
+```
+
+# Data
+```{r}
+data_wide  <- read.csv(pad_data, check.names = FALSE)
+referenties <- read_excel(pad_ref)
+```
+
+# Basis
+```{r}
+toon_labresultaat <- function(df, labnummer, ref_df) {
+  
+  resultaat_breed <- df %>% filter(UniekLabnummer == labnummer)
+  
+  if (nrow(resultaat_breed) == 0) {
+    message("Labnummer ", labnummer, " is niet gevonden.")
+    return(NULL)
+  }
+  
+  persoon_geslacht <- resultaat_breed$Geslacht[1]
+  
+  beschrijving <- resultaat_breed$Beschrijving[1]
+  
+  resultaat_lang <- resultaat_breed %>%
+    mutate(across(everything(), as.character)) %>%
+    pivot_longer(cols = everything(), names_to = "Naam", values_to = "Resultaat") %>%
+    
+    filter(!Naam %in% c(kolommen_verwijderen, "Beschrijving")) %>%
+    
+    rowwise() %>%
+    mutate(
+      Normaalwaarden = {
+        match_index <- which(stringr::str_detect(Naam, fixed(ref_df$Waarde)))
+        if (length(match_index) > 0) {
+          if (!is.na(persoon_geslacht) && persoon_geslacht == "M") ref_df$Man[match_index[1]]
+          else if (!is.na(persoon_geslacht) && persoon_geslacht == "V") ref_df$Vrouw[match_index[1]]
+          else NA_character_
+        } else NA_character_
+      }
+    ) %>%
+    ungroup() %>%
+    mutate(Naam = factor(Naam, levels = gewenste_volgorde)) %>%
+    arrange(Naam)
+  
+  return(list(tabel = resultaat_lang, beschrijving = beschrijving))
+}
+```
+
+# red number if outside ref values
+```{r}
+is_afwijkend <- function(naam, res_num, geslacht) {
+  case_when(
+    is.na(res_num) ~ FALSE,
+    naam == "Bezinking (mm)"              & geslacht == "M" & (res_num < 0    | res_num > 14)   ~ TRUE,
+    naam == "Bezinking (mm)"              & geslacht == "V" & (res_num < 0    | res_num > 19)   ~ TRUE,
+    naam == "Erytrocyten (10E12/L)"       & geslacht == "M" & (res_num < 4.20 | res_num > 5.60) ~ TRUE,
+    naam == "Erytrocyten (10E12/L)"       & geslacht == "V" & (res_num < 3.70 | res_num > 5.00) ~ TRUE,
+    naam == "Hemoglobine (mmol/L)"        & geslacht == "M" & (res_num < 8.2  | res_num > 11.0) ~ TRUE,
+    naam == "Hemoglobine (mmol/L)"        & geslacht == "V" & (res_num < 7.3  | res_num > 9.7)  ~ TRUE,
+    naam == "MCV (fL)"                                      & (res_num < 80   | res_num > 100)  ~ TRUE,
+    naam == "Reticulocyten absoluut (10E9/L)"               & (res_num < 20   | res_num > 90)   ~ TRUE,
+    naam == "Reticulocyten relatief (0/00)"                 & (res_num < 2    | res_num > 20)   ~ TRUE,
+    naam == "Trombocyten (10E9/L)"                          & (res_num < 130  | res_num > 350)  ~ TRUE,
+    naam == "Leucocyten (10E9/L)"                           & (res_num < 3.5  | res_num > 11.0) ~ TRUE,
+    naam == "Kreatinine (umol/L)"         & geslacht == "M" & (res_num < 60   | res_num > 115)  ~ TRUE,
+    naam == "Kreatinine (umol/L)"         & geslacht == "V" & (res_num < 50   | res_num > 100)  ~ TRUE,
+    naam == "eGFR CKD-EPI (mL/min/1.73m)"                  &  res_num < 90                     ~ TRUE,
+    naam == "ALAT (U/L)"                  & geslacht == "M" &  res_num >= 45                    ~ TRUE,
+    naam == "ALAT (U/L)"                  & geslacht == "V" &  res_num >= 34                    ~ TRUE,
+    naam == "LD (U/L)"                    & geslacht == "M" &  res_num >= 248                   ~ TRUE,
+    naam == "LD (U/L)"                    & geslacht == "V" &  res_num >= 247                   ~ TRUE,
+    naam == "NT-proBNP (pmol/L)"                            &  res_num >= 15.0                  ~ TRUE,
+    naam == "Transferrine (g/L)"                            & (res_num < 1.50 | res_num > 3.50) ~ TRUE,
+    naam == "Transf.sat. (%)"                               & (res_num < 20.0 | res_num > 45.0) ~ TRUE,
+    naam == "Ferritine (ug/L)"            & geslacht == "M" & (res_num < 30   | res_num > 400)  ~ TRUE,
+    naam == "Ferritine (ug/L)"            & geslacht == "V" & (res_num < 15   | res_num > 200)  ~ TRUE,
+    naam == "CRP (mg/L)"                                    &  res_num >= 10                    ~ TRUE,
+    naam == "Haptoglobine (g/L)"                            & (res_num < 0.25 | res_num > 1.90) ~ TRUE,
+    naam == "TSH (mU/L)"                                    & (res_num < 0.65 | res_num > 6.7)  ~ TRUE,
+    naam == "Vitamine B12 (pmol/L)"                         & (res_num < 145  | res_num > 569)  ~ TRUE,
+    naam == "Foliumzuur (nmol/L)"                           & (res_num < 8.0  | res_num > 60.8) ~ TRUE,
+    naam == "IJzer (umol/L)"              & geslacht == "M" & (res_num < 14.0 | res_num > 27.0) ~ TRUE,
+    naam == "IJzer (umol/L)"              & geslacht == "V" & (res_num < 11.0 | res_num > 25.0) ~ TRUE,
+    naam == "Hematocriet (L/L)"           & geslacht == "M" & (res_num < 0.41 | res_num > 0.52) ~ TRUE,
+    naam == "Hematocriet (L/L)"           & geslacht == "V" & (res_num < 0.36 | res_num > 0.48) ~ TRUE,
+    naam == "Dummy BSE (mm)"              & geslacht == "M" & (res_num < 0    | res_num > 14)   ~ TRUE,
+    naam == "Dummy BSE (mm)"              & geslacht == "V" & (res_num < 0    | res_num > 19)   ~ TRUE,
+    naam == "Dummy ery (10E12/L)"         & geslacht == "M" & (res_num < 4.20 | res_num > 5.60) ~ TRUE,
+    naam == "Dummy ery (10E12/L)"         & geslacht == "V" & (res_num < 3.70 | res_num > 5.00) ~ TRUE,
+    naam == "Dummy Leuco (10E9/L)"                          & (res_num < 3.5  | res_num > 11.0) ~ TRUE,
+    naam == "Dummy trombo (10E9/L)"                         & (res_num < 130  | res_num > 350)  ~ TRUE,
+    naam == "Dummy RTC (0/00)"                              & (res_num < 2    | res_num > 20)   ~ TRUE,
+    TRUE ~ FALSE
+  )
+}
+```
+
+# make table and save
+```{r}
+maak_gekleurde_flextable <- function(tab, beschrijving = NULL, toon_beschrijving = TRUE) {
+  
+  geslacht <- if (any(tab$Naam == "Geslacht")) tab$Resultaat[tab$Naam == "Geslacht"] else NA
+  
+  tab_check <- tab %>%
+    mutate(
+      Res_num    = as.numeric(str_extract(Resultaat, "[0-9.]+")),
+      afwijkend  = is_afwijkend(Naam, Res_num, geslacht)
+    )
+  
+  n_rows <- nrow(tab_check)
+  mid    <- ceiling(n_rows / 2)
+  links  <- tab_check[1:mid, ]
+  rechts <- tab_check[(mid + 1):n_rows, ]
+  
+  if (nrow(rechts) < nrow(links)) {
+    rechts <- rbind(rechts, data.frame(Naam=NA, Resultaat=NA, Normaalwaarden=NA, Res_num=NA, afwijkend=FALSE))
+  }
+  
+  tab_split <- cbind(links, rechts)
+  colnames(tab_split) <- c("Naam_L", "Resultaat_L", "Normaalwaarden_L", "Res_num_L", "afw_L",
+                           "Naam_R", "Resultaat_R", "Normaalwaarden_R", "Res_num_R", "afw_R")
+  
+  ft <- flextable(tab_split[, c("Naam_L", "Resultaat_L", "Normaalwaarden_L", 
+                                "Naam_R", "Resultaat_R", "Normaalwaarden_R")]) %>%
+    autofit() %>%
+    bold(part = "header") %>%
+    bg(bg = 'white', part = 'all') %>%
+    bg(bg = "#C7C5C5", part = "header") %>%
+    italic(j = c("Normaalwaarden_L", "Normaalwaarden_R"), part = "body") %>%
+    set_header_labels(
+      Naam_L = "Naam", Resultaat_L = "Resultaat", Normaalwaarden_L = "Normaalwaarden",
+      Naam_R = "Naam", Resultaat_R = "Resultaat", Normaalwaarden_R = "Normaalwaarden"
+    )
+  
+  afw_L_rijen <- which(tab_split$afw_L)
+  if (length(afw_L_rijen) > 0) ft <- ft %>% color(i = afw_L_rijen, j = "Resultaat_L", color = "red")
+  
+  afw_R_rijen <- which(tab_split$afw_R)
+  if (length(afw_R_rijen) > 0) ft <- ft %>% color(i = afw_R_rijen, j = "Resultaat_R", color = "red")
+  
+  if (toon_beschrijving && !is.null(beschrijving)) {
+    schone_beschrijving <- stringr::str_squish(beschrijving)
+    
+    ft <- ft %>%
+      add_footer_lines(values = paste0("Te beoordelen conclusie: ", schone_beschrijving)) %>%
+      italic(part = "footer") %>%
+      align(align = "left", part = "footer") %>%
+      color(color = "#0920AB", part = "footer") %>%
+      fontsize(size = 13, part = "footer") %>%
+      padding(padding.top = 10, part = "footer") %>%
+      bg(bg = "white", part = "footer")
+  }
+  
+  return(ft)
+}
+
+sla_flextable_op <- function(ft, bestandsnaam, pad) {
+
+  volledig_pad <- file.path(pad, bestandsnaam)
+
+  save_as_image(
+    ft,
+    path = volledig_pad,
+    webshot = "webshot2",
+    zoom = 2
+  )
+}
+```
+
+# example
+```{r}
+labnummer_test <- "x" # redacted
+
+result <- toon_labresultaat(data_wide, labnummer_test, referenties)
+
+tab <- result$tabel
+beschrijving <- result$beschrijving
+
+ft <- maak_gekleurde_flextable(tab, beschrijving)
+ft
+```
+
+```{r}
+exporteer_lab_naar_tekst <- function(tab, beschrijving, labnummer, pad, inclusief_beschrijving = TRUE) {
+  tabel_voor_llm <- tab %>%
+    select(Naam, Resultaat, Normaalwaarden)
+  
+  tabel_md <- knitr::kable(tabel_voor_llm, format = "pipe")
+  
+  inhoud <- c(
+    "## Data Tabel",
+    paste(tabel_md, collapse = "\n")
+  )
+  
+  if (inclusief_beschrijving) {
+    inhoud <- c(inhoud, "", "## Beschrijving", beschrijving)
+  }
+  
+  prefix <- if(inclusief_beschrijving) "judge_data_" else "gen_data_"
+  bestandsnaam <- file.path(pad, paste0(prefix, labnummer, ".txt"))
+  writeLines(inhoud, bestandsnaam)
+}
+```
+
+# 10 testcases
+```{r}
+labnummers_lijst <- c(
+) # redacted
+
+for (labnummer in labnummers_lijst) {
+  res <- toon_labresultaat(data_wide, labnummer, referenties)
+  if (is.null(res)) next
+  
+  ft <- maak_gekleurde_flextable(res$tabel, res$beschrijving, toon_beschrijving = FALSE)
+  sla_flextable_op(ft, paste0("testcase_", labnummer, ".png"), pad_uitvoer)
+  
+  exporteer_lab_naar_tekst(res$tabel, res$beschrijving, labnummer, pad_uitvoer, inclusief_beschrijving = FALSE)
+}
+```
+
+# LLM-as-a-jduge
+```{r}
+kolomnamen   <- names(read_excel(pad_judge, n_max = 0))
+kolom_types  <- ifelse(kolomnamen == "UniekLabnummer OG", "skip", "guess")
+df_judge     <- read_excel(pad_judge, col_types = kolom_types)
+
+for (labnummer in unique(df_judge$UniekLabnummer)) {
+  res <- toon_labresultaat(df_judge, labnummer, referenties)
+  if (is.null(res) || nrow(res$tabel) == 0) next
+  
+  ft <- maak_gekleurde_flextable(res$tabel, res$beschrijving, toon_beschrijving = TRUE)
+  sla_flextable_op(ft, paste0("judge_testcase_", labnummer, ".png"), pad_uitvoer_judge)
+  exporteer_lab_naar_tekst(res$tabel, res$beschrijving, labnummer, pad_uitvoer_judge, inclusief_beschrijving = TRUE)
+}
+```
+
+# Prompt engineering
+```{r}
+pad_prompt_mappen <- list(
+  zeroshot = file.path(data_dir,"output\\zeroshot\\"),
+  oneshot = file.path(data_dir,"output\\oneshot\\"),
+  threeshot = file.path(data_dir,"output\\threeshot\\")
+)
+
+pad_uitvoer_prompt <- file.path(data_dir,"prompt engineering\\")
+```
+```{r}
+preview_gedaan <- FALSE
+ 
+for (shot_naam in names(pad_prompt_mappen)) {
+  
+  map_pad <- pad_prompt_mappen[[shot_naam]]
+  txt_bestanden <- list.files(map_pad, pattern = "\\.txt$", full.names = TRUE)
+  
+  if (length(txt_bestanden) == 0) {
+    message("Geen .txt bestanden gevonden in: ", map_pad)
+    next
+  }
+  
+  for (txt_pad in txt_bestanden) {
+    
+    basis_naam <- tools::file_path_sans_ext(basename(txt_pad))
+    
+    # [UniekLabnummer]_[zero/one/threeshot]_[modelnaam]
+    delen <- strsplit(basis_naam, "_")[[1]]
+    labnummer <- delen[1]
+    
+    res <- toon_labresultaat(data_wide, labnummer, referenties)
+    if (is.null(res)) next
+    
+    model_beschrijving <- paste(readLines(txt_pad, warn = FALSE), collapse = " ")
+    model_beschrijving <- stringr::str_squish(model_beschrijving)
+    
+    ft <- maak_gekleurde_flextable(
+      tab            = res$tabel,
+      beschrijving   = model_beschrijving,
+      toon_beschrijving = TRUE
+    )
+    
+    png_naam <- paste0(basis_naam, ".png")
+    sla_flextable_op(ft, png_naam, pad_uitvoer_prompt)
+    
+    # preview first table
+    if (!preview_gedaan) {
+      message("Preview van: ", basis_naam)
+      print(ft)
+      preview_gedaan <- TRUE
+    }
+  }
+}
+```
+
+# RAG
+```{r}
+pad_prompt_mappen <- list(
+  hist = file.path(data_dir,"RAG_output\\"),
+  goud = file.path(data_dir,"RAG_goud\\")
+)
+
+pad_uitvoer_prompt <- file.path(data_dir,"RAG_format\\")
+```
+```{r}
+preview_gedaan <- FALSE
+teller <- 0
+
+for (shot_naam in names(pad_prompt_mappen)) {
+  
+  map_pad <- pad_prompt_mappen[[shot_naam]]
+  txt_bestanden <- list.files(map_pad, pattern = "\\.txt$", full.names = TRUE)
+  
+  if (length(txt_bestanden) == 0) {
+    message("Geen .txt bestanden gevonden in: ", map_pad)
+    next
+  }
+  
+  for (txt_pad in txt_bestanden) {
+    teller <- teller + 1
+    message("Verwerking ", teller, "/", length(txt_bestanden), ": ", basename(txt_pad))
+    flush.console()
+    
+    basis_naam <- tools::file_path_sans_ext(basename(txt_pad))
+    delen <- strsplit(basis_naam, "_")[[1]]
+    labnummer <- delen[1]
+    
+    res <- toon_labresultaat(data_wide, labnummer, referenties)
+    if (is.null(res)) {
+      message("NIET GEVONDEN: ", labnummer)
+      next
+    }
+    
+    model_beschrijving <- paste(readLines(txt_pad, warn = FALSE), collapse = " ")
+    model_beschrijving <- stringr::str_squish(model_beschrijving)
+    
+    ft <- maak_gekleurde_flextable(
+      tab               = res$tabel,
+      beschrijving      = model_beschrijving,
+      toon_beschrijving = TRUE
+    )
+    
+    png_naam <- paste0(basis_naam, ".png")
+    tryCatch(
+      sla_flextable_op(ft, png_naam, pad_uitvoer_prompt),
+      error = function(e) message("FOUT bij opslaan ", png_naam, ": ", e$message)
+    )
+  }
+}
+
+```
+```{r}
+length(list.files(pad_uitvoer_prompt, pattern = "\\.png$"))
+```
+# QLoRA
+```{r}
+pad_prompt_mappen <- list(
+  hist = file.path(data_dir,"QLoRA\\Historisch\\"),
+  goud = file.path(data_dir,"QLoRA\\Goud\\")
+)
+
+pad_uitvoer_prompt <- file.path(data_dir,"QLoRA_format\\")
+```
+```{r}
+preview_gedaan <- FALSE
+teller <- 0
+
+for (shot_naam in names(pad_prompt_mappen)) {
+  
+  map_pad <- pad_prompt_mappen[[shot_naam]]
+  txt_bestanden <- list.files(map_pad, pattern = "\\.txt$", full.names = TRUE)
+  
+  if (length(txt_bestanden) == 0) {
+    message("Geen .txt bestanden gevonden in: ", map_pad)
+    next
+  }
+  
+  for (txt_pad in txt_bestanden) {
+    teller <- teller + 1
+    message("Verwerking ", teller, "/", length(txt_bestanden), ": ", basename(txt_pad))
+    flush.console()
+    
+    basis_naam <- tools::file_path_sans_ext(basename(txt_pad))
+    delen <- strsplit(basis_naam, "_")[[1]]
+    labnummer <- delen[1]
+    
+    res <- toon_labresultaat(data_wide, labnummer, referenties)
+    if (is.null(res)) {
+      message("NIET GEVONDEN: ", labnummer)
+      next
+    }
+    
+    model_beschrijving <- paste(readLines(txt_pad, warn = FALSE), collapse = " ")
+    model_beschrijving <- stringr::str_squish(model_beschrijving)
+    
+    ft <- maak_gekleurde_flextable(
+      tab               = res$tabel,
+      beschrijving      = model_beschrijving,
+      toon_beschrijving = TRUE
+    )
+    
+    png_naam <- paste0(basis_naam, ".png")
+    tryCatch(
+      sla_flextable_op(ft, png_naam, pad_uitvoer_prompt),
+      error = function(e) message("FOUT bij opslaan ", png_naam, ": ", e$message)
+    )
+  }
+}
+```
+
+# 15 validatiecases (LAB only):
+```{r}
+pad_validatie_data    <- file.path(data_dir,"15 validatie\\cases_clinical_validation DEF.xlsx")
+pad_uitvoer_validatie <- file.path(data_dir,"15 validatie\\")
+
+data_validatie <- read_excel(pad_validatie_data)
+
+labnummers_validatie <- unique(data_validatie$UniekLabnummer)
+
+for (labnummer in labnummers_validatie) {
+  res <- toon_labresultaat(data_validatie, labnummer, referenties)
+  if (is.null(res)) next
+
+  ft <- maak_gekleurde_flextable(res$tabel, res$beschrijving, toon_beschrijving = FALSE)
+  sla_flextable_op(ft, paste0("testcase_", labnummer, "_LAB.png"), pad_uitvoer_validatie)
+
+  exporteer_lab_naar_tekst(
+    tab = res$tabel,
+    beschrijving = res$beschrijving,
+    labnummer = labnummer,
+    pad = pad_uitvoer_validatie,
+    inclusief_beschrijving = FALSE
+  )
+}
+```
+
+# 15 validation cases with conclusions
+```{r}
+pad_eindvalidatie <- file.path(data_dir,"eindvalidatie\\eindvalidatie_combi.xlsx")
+pad_uitvoer_eindvalidatie <- file.path(data_dir,"15 validatie\\")
+
+data_eindvalidatie <- read_excel(pad_eindvalidatie)
+
+beschrijving_kolommen <- list(
+  "_A" = "Protocol (boom)",
+  "_B" = "Humaan",
+  "_C" = "LLM"
+)
+
+for (labnummer in unique(data_eindvalidatie$UniekLabnummer)) {
+  
+  res <- toon_labresultaat(data_eindvalidatie, labnummer, referenties)
+  if (is.null(res)) next
+  
+  res$tabel <- res$tabel %>%
+    filter(!Naam %in% c("Protocol (boom)", "Humaan", "LLM"))
+  
+  for (suffix in names(beschrijving_kolommen)) {
+    kolom <- beschrijving_kolommen[[suffix]]
+    
+    rij <- data_eindvalidatie %>% filter(UniekLabnummer == labnummer)
+    beschrijving_huidig <- if (kolom %in% names(rij)) rij[[kolom]][1] else NA_character_
+    
+    ft <- maak_gekleurde_flextable(
+      tab               = res$tabel,
+      beschrijving      = beschrijving_huidig,
+      toon_beschrijving = TRUE
+    )
+    
+    png_naam <- paste0("testcase_", labnummer, suffix, ".png")
+    tryCatch(
+      sla_flextable_op(ft, png_naam, pad_uitvoer_eindvalidatie),
+      error = function(e) message("FOUT bij opslaan ", png_naam, ": ", e$message)
+    )
+  }
+}
+```
