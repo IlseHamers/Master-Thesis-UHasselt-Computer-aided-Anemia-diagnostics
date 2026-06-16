@@ -1,0 +1,257 @@
+---
+title: "RAG_prep_thesis"
+author: "Ilse Hamers"
+date: "2026-05-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# readme
+This script prepares the historic, gold standard, and test data for RAG/KNN.
+- lab values are turned into numeric values
+- values are converted into a direction class relative to reference range
+
+## Libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readxl)
+```
+
+# Data
+```{r}
+data_dir <- Sys.getenv("ANEMIA_DATA_DIR", unset = "data")
+path <- file.path(data_dir, "data_clean_wide.csv")
+
+data <- read.csv(path, check.names = FALSE) %>%
+  select(-`Anemie protocol`)
+
+path_testcases <- file.path(data_dir, "10_testcases_wide.csv")
+data_test <- read.csv(path_testcases, check.names = FALSE) %>%
+  select(-Patientnummer, -`Anemie protocol`)
+```
+
+# exclude test cases from ref data
+```{r}
+test_ids <- c(
+  
+) # censored
+
+data <- data %>%
+  filter(!UniekLabnummer %in% test_ids)
+
+write.csv(data, "data_originieel_z10_RAG.csv", row.names = FALSE)
+```
+
+# Age from 44j to 44
+```{r}
+data <- data %>%
+  mutate(Leeftijd = as.numeric(str_remove(Leeftijd, "j")))
+
+data_test <- data_test %>%
+  mutate(Leeftijd = as.numeric(str_remove(Leeftijd, "j")))
+```
+
+# handle < and >
+< x becomes half of x, > x becomes double of x
+```{r}
+parse_lab_value <- function(x) {
+  case_when(
+    str_detect(x, "^<") ~ as.numeric(str_remove(x, "^<")) / 2,
+    str_detect(x, "^>") ~ as.numeric(str_remove(x, "^>")) * 2,
+    TRUE ~ suppressWarnings(as.numeric(x))
+  )
+}
+
+data <- data %>%
+  mutate(across(
+    .cols = where(is.character) & -all_of(c("Geslacht", "Beschrijving")),
+    .fns  = parse_lab_value
+  ))
+
+data_test <- data_test %>%
+  mutate(across(
+    .cols = where(is.character) & -all_of(c("Geslacht", "Beschrijving")),
+    .fns  = parse_lab_value
+  ))
+
+# strip unit from column name to match reference value table
+clean_names <- function(x) {
+  str_trim(str_remove(x, "\\s*\\(.*\\)"))
+}
+colnames(data)      <- clean_names(colnames(data))
+colnames(data_test) <- clean_names(colnames(data_test))
+```
+
+# Load reference table
+```{r}
+path_ref <- file.path(data_dir, "Referentiewaarden.xlsx")
+ref <- read_excel(path_ref)
+```
+
+# ref value range per sex into column
+- x-x
+- <x
+- >x
+```{r}
+# upper = NA for "< x", lower = NA for "> x".
+parseer_referentie <- function(ref_str) {
+  ref_str <- str_trim(as.character(ref_str))
+  if (is.na(ref_str) || ref_str == "" || ref_str == "NA") {
+    return(c(NA_real_, NA_real_))
+  }
+  if (str_detect(ref_str, "^[0-9.,]+\\s*-\\s*[0-9.,]+$")) {
+    delen <- str_split(ref_str, "\\s*-\\s*")[[1]]
+    return(c(as.numeric(str_replace(delen[1], ",", ".")),
+             as.numeric(str_replace(delen[2], ",", "."))))
+  }
+  if (str_detect(ref_str, "^<\\s*[0-9.,]+$")) {
+    return(c(NA_real_,
+             as.numeric(str_replace(str_remove(ref_str, "^<\\s*"), ",", "."))))
+  }
+  if (str_detect(ref_str, "^>\\s*[0-9.,]+$")) {
+    return(c(as.numeric(str_replace(str_remove(ref_str, "^>\\s*"), ",", ".")),
+             NA_real_))
+  }
+  c(NA_real_, NA_real_)
+}
+
+bouw_ref_tabel <- function(ref) {
+  ref_tabel <- list()
+  for (i in seq_len(nrow(ref))) {
+    ref_tabel[[ref$Waarde[i]]] <- list(
+      M = parseer_referentie(ref$Man[i]),
+      V = parseer_referentie(ref$Vrouw[i])
+    )
+  }
+  ref_tabel
+}
+
+ref_tabel <- bouw_ref_tabel(ref)
+```
+
+# Direction class: -2 / -1 / 0 / +1 / +2
+```{r}
+# thresholds "very low/high": gap > 30% (low) or > 50% (high) to reference.
+# were chosen empirically with clinical chemist
+THRESH_LOW  <- 0.30
+THRESH_HIGH <- 0.50
+
+direction_class <- function(v, lower, upper) {
+  if (is.na(v)) return(NA_integer_)
+
+  if (is.na(lower)) {                         # "< upper" eenzijdig
+    if (v <= upper) return(0L)
+    gap <- (v - upper) / upper
+    return(if (gap > THRESH_HIGH) 2L else 1L)
+  }
+  if (is.na(upper)) {                         # "> lower" eenzijdig
+    if (v >= lower) return(0L)
+    gap <- (lower - v) / lower
+    return(if (gap > THRESH_LOW) -2L else -1L)
+  }
+  if (v >= lower & v <= upper) return(0L)     # tweezijdig
+  if (v < lower) {
+    gap <- (lower - v) / max(lower, 1)
+    return(if (gap > THRESH_LOW) -2L else -1L)
+  } else {
+    gap <- (v - upper) / max(upper, 1)
+    return(if (gap > THRESH_HIGH) 2L else 1L)
+  }
+}
+```
+
+# Classify dataset
+also keeps raw value in case of tie-rbeaking during KNN
+```{r}
+classificeer_dataset <- function(data, ref_tabel) {
+
+  meta_kolommen <- c("UniekLabnummer", "Leeftijd", "Geslacht",
+                     "Anemie protocol", "Beschrijving", "Source")
+  lab_kolommen  <- setdiff(names(data), meta_kolommen)
+
+  bekend <- intersect(lab_kolommen, names(ref_tabel))
+
+  class_cols <- map_dfc(bekend, function(lab) {
+    klassen <- map2_int(
+      data[[lab]],
+      data$Geslacht,
+      function(v, s) {
+        sleutel <- if (!is.na(s) && s == "M") "M" else "V"
+        r       <- ref_tabel[[lab]][[sleutel]]
+        direction_class(v, r[1], r[2])
+      }
+    )
+    tibble(!!paste0(lab, "_klasse") := klassen)
+  })
+
+  raw_cols <- data %>% select(all_of(bekend))
+  names(raw_cols) <- paste0(names(raw_cols), "_raw")
+
+  bind_cols(
+    data %>% select(UniekLabnummer, Geslacht),
+    class_cols,
+    raw_cols
+  )
+}
+```
+
+# apply to reference (historic) and test
+```{r}
+referentie_klassen <- classificeer_dataset(data, ref_tabel)
+testcases_klassen <- classificeer_dataset(data_test, ref_tabel)
+
+write.csv(referentie_klassen, "referentie_database_klassen_RAG.csv", row.names = FALSE)
+write.csv(testcases_klassen, "10_testcases_klassen_RAG.csv", row.names = FALSE)
+```
+
+# check proportions
+```{r}
+klasse_kolommen <- names(referentie_klassen)[grepl("_klasse$", names(referentie_klassen))]
+
+sanity <- map_dfr(klasse_kolommen, function(k) {
+  x <- referentie_klassen[[k]]
+  tibble(
+    kolom = k,
+    n = sum(!is.na(x)),
+    pct_na = round(mean(is.na(x)) * 100, 1),
+    pct_neg2 = round(mean(x == -2, na.rm = TRUE) * 100, 1),
+    pct_neg1 = round(mean(x == -1, na.rm = TRUE) * 100, 1),
+    pct_0 = round(mean(x == 0, na.rm = TRUE) * 100, 1),
+    pct_pos1 = round(mean(x == 1, na.rm = TRUE) * 100, 1),
+    pct_pos2 = round(mean(x == 2, na.rm = TRUE) * 100, 1)
+  )
+})
+
+print(sanity)
+```
+
+# Gold standard
+same thing
+```{r}
+path_goud <- file.path(data_dir, "Gouden_standaard.xlsx")
+data_goud <- read_excel(path_goud) %>%
+  select(-Patientnummer, -`Anemie protocol`)
+
+colnames(data_goud) <- clean_names(colnames(data_goud))
+
+# age to numeric
+data_goud <- data_goud %>%
+  mutate(Leeftijd = as.numeric(str_remove(.data$Leeftijd, "j")))
+
+# < and >
+data_goud <- data_goud %>%
+  mutate(across(
+    .cols = where(is.character) & -any_of(c("Geslacht", "Beschrijving", "UniekLabnummer")),
+    .fns  = parse_lab_value
+  ))
+
+goud_klassen <- classificeer_dataset(data_goud, ref_tabel)
+
+write.csv(goud_klassen, "data_goud_klassen_RAG.csv", row.names = FALSE)
+```
